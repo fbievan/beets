@@ -8,16 +8,42 @@ Changelog goes here! Please add your entry to the bottom of one of the lists bel
 
 New features:
 
+* New template function added: ``%capitalize``. Converts the first letter of
+  the text to uppercase and the rest to lowercase.
 * Ability to query albums with track db fields and vice-versa, for example
   `beet list -a title:something` or `beet list artpath:cover`. Consequently
   album queries involving `path` field have been sped up, like `beet list -a
   path:/path/`.
+* New `keep_in_artist` option for the :doc:`plugins/ftintitle` plugin, which
+  allows keeping the "feat." part in the artist metadata while still changing
+  the title.
+* :doc:`plugins/autobpm`: Add new configuration option ``beat_track_kwargs``
+  which enables adjusting keyword arguments supplied to librosa's
+  ``beat_track`` function call.
+* Beets now uses ``platformdirs`` to determine the default music directory.
+  This location varies between systems -- for example, users can configure it
+  on Unix systems via ``user-dirs.dirs(5)``.
 
 Bug fixes:
 
-* Improved naming of temporary files by separating the random part with the file extension.
-* Fixed the ``auto`` value for the :ref:`reflink` config option.
-* Fixed lyrics plugin only getting part of the lyrics from ``Genius.com`` :bug:`4815`
+* :doc:`plugins/ftintitle`: The detection of a "feat. X" part in a song title does not produce any false
+  positives caused by words like "and" or "with" anymore. :bug:`5441`
+* :doc:`plugins/ftintitle`: The detection of a "feat. X" part now also matches such parts if they are in
+  parentheses or brackets. :bug:`5436`
+* Improve naming of temporary files by separating the random part with the file extension.
+* Fix the ``auto`` value for the :ref:`reflink` config option.
+* Fix lyrics plugin only getting part of the lyrics from ``Genius.com`` :bug:`4815`
+* Album flexible fields are now correctly saved. For instance MusicBrainz external links
+  such as `bandcamp_album_id` will be available on albums in addition to tracks.
+  For albums already in your library, a re-import is required for the fields to be added.
+  Such a re-import can be done with, in this case, `beet import -L data_source:=MusicBrainz`.
+* :doc:`plugins/autobpm`: Fix the ``TypeError`` where tempo was being returned
+  as a numpy array. Update ``librosa`` dependency constraint to prevent similar
+  issues in the future.
+  :bug:`5289`
+* :doc:`plugins/discogs`: Fix the ``TypeError`` when there is no description.
+* Remove single quotes from all SQL queries
+  :bug:`4709`
 
 For packagers:
 
@@ -50,6 +76,14 @@ Other changes:
   checked.
 * The long-deprecated `beets.util.confit` module has been removed.  This may
   cause extremely outdated external plugins to fail to load.
+* :doc:`plugins/autobpm`: Add plugin dependencies to `pyproject.toml` under
+  the `autobpm` extra and update the plugin installation instructions in the
+  docs.
+  Since importing the bpm calculation functionality from ``librosa`` takes
+  around 4 seconds, update the plugin to only do so when it actually needs to
+  calculate the bpm. Previously this import was being done immediately, so
+  every ``beet`` invocation was being delayed by a couple of seconds.
+  :bug:`5185`
 
 2.0.0 (May 30, 2024)
 --------------------
@@ -211,9 +245,12 @@ New features:
 * Add support for `barcode` field.
   :bug:`3172`
 * :doc:`/plugins/smartplaylist`: Add new config option `smartplaylist.fields`.
+* :doc:`/plugins/fetchart`: Defer source removal config option evaluation to
+  the point where they are used really, supporting temporary config changes.
 
 Bug fixes:
 
+* :doc:`/plugins/deezer`: Improve requests error handling.
 * :doc:`/plugins/lastimport`: Improve error handling in the `process_tracks` function and enable it to be used with other plugins.
 * :doc:`/plugins/spotify`: Improve handling of ConnectionError.
 * :doc:`/plugins/deezer`: Improve Deezer plugin error handling and set requests timeout to 10 seconds.
@@ -350,7 +387,7 @@ Bug fixes:
   :bug:`4947`
 * Fix bug where unimported plugin would not ignore children directories of
   ignored directories.
-  :bug:`5130` 
+  :bug:`5130`
 * Fix bug where some plugin commands hang indefinitely due to a missing
   `requests` timeout.
 * Fix cover art resizing logic to support multiple steps of resizing

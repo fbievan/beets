@@ -59,7 +59,7 @@ class StoreTest(ItemInDBTestCase):
         self.i.store()
         new_year = (
             self.lib._connection()
-            .execute("select year from items where " 'title="the title"')
+            .execute("select year from items where title = ?", (self.i.title,))
             .fetchone()["year"]
         )
         assert new_year == 1987
@@ -70,7 +70,7 @@ class StoreTest(ItemInDBTestCase):
         self.i.store()
         new_genre = (
             self.lib._connection()
-            .execute("select genre from items where " 'title="the title"')
+            .execute("select genre from items where title = ?", (self.i.title,))
             .fetchone()["genre"]
         )
         assert new_genre == original_genre
@@ -104,7 +104,8 @@ class AddTest(BeetsTestCase):
         new_grouping = (
             self.lib._connection()
             .execute(
-                "select grouping from items " 'where composer="the composer"'
+                "select grouping from items where composer = ?",
+                (self.i.composer,),
             )
             .fetchone()["grouping"]
         )
@@ -118,7 +119,8 @@ class AddTest(BeetsTestCase):
         new_grouping = (
             self.lib._connection()
             .execute(
-                "select grouping from items " 'where composer="the composer"'
+                "select grouping from items where composer = ?",
+                (self.i.composer,),
             )
             .fetchone()["grouping"]
         )
@@ -628,6 +630,10 @@ class DestinationFunctionTest(BeetsTestCase, PathFormattingMixin):
     def test_upper_case_variable(self):
         self._setf("%upper{$title}")
         self._assert_dest(b"/base/THE TITLE")
+
+    def test_capitalize_variable(self):
+        self._setf("%capitalize{$title}")
+        self._assert_dest(b"/base/The title")
 
     def test_title_case_variable(self):
         self._setf("%title{$title}")

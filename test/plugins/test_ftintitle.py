@@ -14,7 +14,6 @@
 
 """Tests for the 'ftintitle' plugin."""
 
-
 import unittest
 
 from beets.test.helper import PluginTestCase
@@ -33,10 +32,13 @@ class FtInTitlePluginFunctional(PluginTestCase):
             albumartist=aartist,
         )
 
-    def _ft_set_config(self, ftformat, drop=False, auto=True):
+    def _ft_set_config(
+        self, ftformat, drop=False, auto=True, keep_in_artist=False
+    ):
         self.config["ftintitle"]["format"] = ftformat
         self.config["ftintitle"]["drop"] = drop
         self.config["ftintitle"]["auto"] = auto
+        self.config["ftintitle"]["keep_in_artist"] = keep_in_artist
 
     def test_functional_drop(self):
         item = self._ft_add_item("/", "Alice ft Bob", "Song 1", "Alice")
@@ -74,6 +76,20 @@ class FtInTitlePluginFunctional(PluginTestCase):
         item.load()
         assert item["artist"] == "Alice"
         assert item["title"] == "Song 1 with Bob"
+
+    def test_functional_keep_in_artist(self):
+        self._ft_set_config("feat. {0}", keep_in_artist=True)
+        item = self._ft_add_item("/", "Alice ft Bob", "Song 1", "Alice")
+        self.run_command("ftintitle")
+        item.load()
+        assert item["artist"] == "Alice ft Bob"
+        assert item["title"] == "Song 1 feat. Bob"
+
+        item = self._ft_add_item("/", "Alice ft Bob", "Song 1", "Alice")
+        self.run_command("ftintitle", "-d")
+        item.load()
+        assert item["artist"] == "Alice ft Bob"
+        assert item["title"] == "Song 1"
 
 
 class FtInTitlePluginTest(unittest.TestCase):
@@ -164,8 +180,12 @@ class FtInTitlePluginTest(unittest.TestCase):
         assert ftintitle.contains_feat("Alice feat. Bob")
         assert ftintitle.contains_feat("Alice feat Bob")
         assert ftintitle.contains_feat("Alice featuring Bob")
-        assert ftintitle.contains_feat("Alice & Bob")
-        assert ftintitle.contains_feat("Alice and Bob")
-        assert ftintitle.contains_feat("Alice With Bob")
+        assert ftintitle.contains_feat("Alice (ft. Bob)")
+        assert ftintitle.contains_feat("Alice (feat. Bob)")
+        assert ftintitle.contains_feat("Alice [ft. Bob]")
+        assert ftintitle.contains_feat("Alice [feat. Bob]")
         assert not ftintitle.contains_feat("Alice defeat Bob")
         assert not ftintitle.contains_feat("Aliceft.Bob")
+        assert not ftintitle.contains_feat("Alice (defeat Bob)")
+        assert not ftintitle.contains_feat("Live and Let Go")
+        assert not ftintitle.contains_feat("Come With Me")
