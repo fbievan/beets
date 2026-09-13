@@ -1,42 +1,40 @@
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """This module contains all of the core logic for beets' command-line
 interface. To invoke the CLI, just call beets.ui.main(). The actual
 CLI commands are implemented in the ui.commands module.
 """
 
+from __future__ import annotations
+
 import errno
 import optparse
 import os.path
-import re
+import shutil
 import sqlite3
-import struct
 import sys
 import textwrap
 import traceback
-from difflib import SequenceMatcher
-from typing import Any, Callable
+from functools import cache
+from typing import TYPE_CHECKING, Any, Literal, TextIO, TypeVar, overload
 
 import confuse
 
 from beets import config, library, logging, plugins, util
-from beets.autotag import mb
 from beets.dbcore import db
 from beets.dbcore import query as db_query
+from beets.exceptions import UserError
 from beets.util import as_string
-from beets.util.functemplate import template
+from beets.util.color import colorize
+from beets.util.deprecation import deprecate_for_maintainers
+from beets.util.diff import get_model_changes
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Sequence
+    from pathlib import Path
+
+    from beets.library import LibModel
+    from beets.util.color import ColorName
+
+T = TypeVar("T")
 
 # On Windows platforms, use colorama to support "ANSI" terminal colors.
 if sys.platform == "win32":
@@ -49,37 +47,22 @@ if sys.platform == "win32":
 
 
 log = logging.getLogger("beets")
-if not log.handlers:
-    log.addHandler(logging.StreamHandler())
-log.propagate = False  # Don't propagate to root handler.
-
-
-PF_KEY_QUERIES = {
-    "comp": "comp:true",
-    "singleton": "singleton:true",
-}
-
-
-class UserError(Exception):
-    """UI exception. Commands should throw this in order to display
-    nonrecoverable errors to the user.
-    """
 
 
 # Encoding utilities.
 
 
-def _in_encoding():
+def _in_encoding() -> str:
     """Get the encoding to use for *inputting* strings from the console."""
     return _stream_encoding(sys.stdin)
 
 
-def _out_encoding():
+def _out_encoding() -> str:
     """Get the encoding to use for *outputting* strings to the console."""
     return _stream_encoding(sys.stdout)
 
 
-def _stream_encoding(stream, default="utf-8"):
+def _stream_encoding(stream: TextIO, default: str = "utf-8") -> str:
     """A helper for `_in_encoding` and `_out_encoding`: get the stream's
     preferred encoding, using a configured override or a default
     fallback if neither is not specified.
@@ -100,30 +83,26 @@ def _stream_encoding(stream, default="utf-8"):
     return stream.encoding or default
 
 
-def decargs(arglist):
+def decargs(arglist: list[bytes]) -> list[bytes]:
     """Given a list of command-line argument bytestrings, attempts to
     decode them to Unicode strings when running under Python 2.
+
+    .. deprecated:: 2.4.0
+       This function will be removed in 3.0.0.
     """
+    deprecate_for_maintainers("'beets.ui.decargs'")
     return arglist
 
 
-def print_(*strings, **kwargs):
+def print_(*strings: str, end: str = "\n") -> None:
     """Like print, but rather than raising an error when a character
     is not in the terminal's encoding's character set, just silently
     replaces it.
 
-    The arguments must be Unicode strings: `unicode` on Python 2; `str` on
-    Python 3.
-
     The `end` keyword argument behaves similarly to the built-in `print`
     (it defaults to a newline).
     """
-    if not strings:
-        strings = [""]
-    assert isinstance(strings[0], str)
-
-    txt = " ".join(strings)
-    txt += kwargs.get("end", "\n")
+    txt = f"{' '.join(strings or ('',))}{end}"
 
     # Encode the string and write it to stdout.
     # On Python 3, sys.stdout expects text strings and uses the
@@ -143,24 +122,23 @@ def print_(*strings, **kwargs):
 # Configuration wrappers.
 
 
-def _bool_fallback(a, b):
+def _bool_fallback(a: bool | None, b: bool) -> bool:
     """Given a boolean or None, return the original value or a fallback."""
     if a is None:
         assert isinstance(b, bool)
         return b
-    else:
-        assert isinstance(a, bool)
-        return a
+    assert isinstance(a, bool)
+    return a
 
 
-def should_write(write_opt=None):
+def should_write(write_opt: bool | None = None) -> bool:
     """Decide whether a command that updates metadata should also write
     tags, using the importer configuration as the default.
     """
     return _bool_fallback(write_opt, config["import"]["write"].get(bool))
 
 
-def should_move(move_opt=None):
+def should_move(move_opt: bool | None = None) -> bool:
     """Decide whether a command that updates metadata should also move
     files when they're inside the library, using the importer
     configuration as the default.
@@ -180,12 +158,7 @@ def should_move(move_opt=None):
 # Input prompts.
 
 
-def indent(count):
-    """Returns a string with `count` many spaces."""
-    return " " * count
-
-
-def input_(prompt=None):
+def input_(prompt: str | None = None) -> str:
     """Like `input`, but decodes the result to a Unicode string.
     Raises a UserError if stdin is not available. The prompt is sent to
     stdout rather than stderr. A printed between the prompt and the
@@ -205,15 +178,46 @@ def input_(prompt=None):
     return resp
 
 
+@overload
 def input_options(
-    options,
-    require=False,
-    prompt=None,
-    fallback_prompt=None,
-    numrange=None,
-    default=None,
-    max_width=72,
-):
+    options: tuple[()],
+    require: bool = False,
+    prompt: str | None = None,
+    fallback_prompt: str | None = None,
+    *,
+    numrange: tuple[int, int],
+    default: str | None = None,
+    max_width: int = 72,
+) -> int: ...
+@overload
+def input_options(
+    options: Sequence[str],
+    require: bool = False,
+    prompt: str | None = None,
+    fallback_prompt: str | None = None,
+    numrange: None = None,
+    default: str | None = None,
+    max_width: int = 72,
+) -> str: ...
+@overload
+def input_options(
+    options: Sequence[str],
+    require: bool = False,
+    prompt: str | None = None,
+    fallback_prompt: str | None = None,
+    numrange: tuple[int, int] = ...,
+    default: str | None = None,
+    max_width: int = 72,
+) -> str | int: ...
+def input_options(
+    options: Sequence[str],
+    require: bool = False,
+    prompt: str | None = None,
+    fallback_prompt: str | None = None,
+    numrange: tuple[int, int] | None = None,
+    default: str | None = None,
+    max_width: int = 72,
+) -> str | int:
     """Prompts a user for input. The sequence of `options` defines the
     choices the user has. A single-letter shortcut is inferred for each
     option; the user's choice is returned as that single, lower-case
@@ -267,7 +271,7 @@ def input_options(
             )
         ):
             # The first option is the default; mark it.
-            show_letter = "[%s]" % found_letter.upper()
+            show_letter = f"[{found_letter.upper()}]"
             is_default = True
         else:
             show_letter = found_letter.upper()
@@ -279,7 +283,9 @@ def input_options(
         )
 
         # Insert the highlighted letter back into the word.
-        descr_color = "action_default" if is_default else "action_description"
+        descr_color: ColorName = (
+            "action_default" if is_default else "action_description"
+        )
         capitalized.append(
             colorize(descr_color, option[:index])
             + show_letter
@@ -291,24 +297,25 @@ def input_options(
 
     # The default is just the first option if unspecified.
     if require:
-        default = None
+        default_choice = None
     elif default is None:
-        if numrange:
-            default = numrange[0]
-        else:
-            default = display_letters[0].lower()
+        default_choice = numrange[0] if numrange else display_letters[0].lower()
+    else:
+        default_choice = default
 
     # Make a prompt if one is not provided.
     if not prompt:
         prompt_parts = []
         prompt_part_lengths = []
         if numrange:
-            if isinstance(default, int):
-                default_name = str(default)
+            if isinstance(default_choice, int):
+                default_name = str(default_choice)
                 default_name = colorize("action_default", default_name)
-                tmpl = "# selection (default %s)"
-                prompt_parts.append(tmpl % default_name)
-                prompt_part_lengths.append(len(tmpl % str(default)))
+                tmpl = "# selection (default {})"
+                prompt_parts.append(tmpl.format(default_name))
+                prompt_part_lengths.append(
+                    len(tmpl) - 2 + len(str(default_choice))
+                )
             else:
                 prompt_parts.append("# selection")
                 prompt_part_lengths.append(len(prompt_parts[-1]))
@@ -336,7 +343,7 @@ def input_options(
 
             if line_length != 0:
                 # Not the beginning of the line; need a space.
-                part = " " + part
+                part = f" {part}"
                 length += 1
 
             prompt += part
@@ -347,41 +354,35 @@ def input_options(
     if not fallback_prompt:
         fallback_prompt = "Enter one of "
         if numrange:
-            fallback_prompt += "%i-%i, " % numrange
-        fallback_prompt += ", ".join(display_letters) + ":"
+            fallback_prompt += "{}-{}, ".format(*numrange)
+        fallback_prompt += f"{', '.join(display_letters)}:"
 
-    resp = input_(prompt)
+    user_choice = input_(prompt)
     while True:
-        resp = resp.strip().lower()
-
+        user_choice = user_choice.strip().lower()
         # Try default option.
-        if default is not None and not resp:
-            resp = default
+        if default_choice is not None and not user_choice:
+            choice = str(default_choice)
+        else:
+            choice = user_choice
 
         # Try an integer input if available.
-        if numrange:
-            try:
-                resp = int(resp)
-            except ValueError:
-                pass
-            else:
-                low, high = numrange
-                if low <= resp <= high:
-                    return resp
-                else:
-                    resp = None
-
+        if numrange and choice.isdigit():
+            int_resp = int(choice)
+            low, high = numrange
+            if low <= int_resp <= high:
+                return int_resp
         # Try a normal letter input.
-        if resp:
-            resp = resp[0]
-            if resp in letters:
-                return resp
+        elif choice:
+            choice = choice[0]
+            if choice in letters:
+                return choice
 
         # Prompt for new input.
-        resp = input_(fallback_prompt)
+        user_choice = input_(fallback_prompt)
 
 
-def input_yn(prompt, require=False):
+def input_yn(prompt: str, require: bool = False) -> bool:
     """Prompts the user for a "yes" or "no" response. The default is
     "yes" unless `require` is `True`, in which case there is no default.
     """
@@ -393,7 +394,12 @@ def input_yn(prompt, require=False):
     return sel == "y"
 
 
-def input_select_objects(prompt, objs, rep, prompt_all=None):
+def input_select_objects(
+    prompt: str,
+    objs: Sequence[T],
+    rep: Callable[[T], Any],
+    prompt_all: str | None = None,
+) -> Sequence[T]:
     """Prompt to user to choose all, none, or some of the given objects.
     Return the list of selected objects.
 
@@ -404,21 +410,21 @@ def input_select_objects(prompt, objs, rep, prompt_all=None):
     objects individually.
     """
     choice = input_options(
-        ("y", "n", "s"), False, "%s? (Yes/no/select)" % (prompt_all or prompt)
+        ("y", "n", "s"), False, f"{prompt_all or prompt}? (Yes/no/select)"
     )
     print()  # Blank line.
 
     if choice == "y":  # Yes.
         return objs
 
-    elif choice == "s":  # Select.
+    if choice == "s":  # Select.
         out = []
         for obj in objs:
             rep(obj)
             answer = input_options(
                 ("y", "n", "q"),
                 True,
-                "%s? (yes/no/quit)" % prompt,
+                f"{prompt}? (yes/no/quit)",
                 "Enter Y or N:",
             )
             if answer == "y":
@@ -427,878 +433,47 @@ def input_select_objects(prompt, objs, rep, prompt_all=None):
                 return out
         return out
 
-    else:  # No.
-        return []
+    # No.
+    return []
 
 
-# Human output formatting.
-
-
-def human_bytes(size):
-    """Formats size, a number of bytes, in a human-readable way."""
-    powers = ["", "K", "M", "G", "T", "P", "E", "Z", "Y", "H"]
-    unit = "B"
-    for power in powers:
-        if size < 1024:
-            return f"{size:3.1f} {power}{unit}"
-        size /= 1024.0
-        unit = "iB"
-    return "big"
-
-
-def human_seconds(interval):
-    """Formats interval, a number of seconds, as a human-readable time
-    interval using English words.
-    """
-    units = [
-        (1, "second"),
-        (60, "minute"),
-        (60, "hour"),
-        (24, "day"),
-        (7, "week"),
-        (52, "year"),
-        (10, "decade"),
-    ]
-    for i in range(len(units) - 1):
-        increment, suffix = units[i]
-        next_increment, _ = units[i + 1]
-        interval /= float(increment)
-        if interval < next_increment:
-            break
-    else:
-        # Last unit.
-        increment, suffix = units[-1]
-        interval /= float(increment)
-
-    return f"{interval:3.1f} {suffix}s"
-
-
-def human_seconds_short(interval):
-    """Formats a number of seconds as a short human-readable M:SS
-    string.
-    """
-    interval = int(interval)
-    return "%i:%02i" % (interval // 60, interval % 60)
-
-
-# Colorization.
-
-# ANSI terminal colorization code heavily inspired by pygments:
-# https://bitbucket.org/birkenfeld/pygments-main/src/default/pygments/console.py
-# (pygments is by Tim Hatch, Armin Ronacher, et al.)
-COLOR_ESCAPE = "\x1b["
-LEGACY_COLORS = {
-    "black": ["black"],
-    "darkred": ["red"],
-    "darkgreen": ["green"],
-    "brown": ["yellow"],
-    "darkyellow": ["yellow"],
-    "darkblue": ["blue"],
-    "purple": ["magenta"],
-    "darkmagenta": ["magenta"],
-    "teal": ["cyan"],
-    "darkcyan": ["cyan"],
-    "lightgray": ["white"],
-    "darkgray": ["bold", "black"],
-    "red": ["bold", "red"],
-    "green": ["bold", "green"],
-    "yellow": ["bold", "yellow"],
-    "blue": ["bold", "blue"],
-    "fuchsia": ["bold", "magenta"],
-    "magenta": ["bold", "magenta"],
-    "turquoise": ["bold", "cyan"],
-    "cyan": ["bold", "cyan"],
-    "white": ["bold", "white"],
-}
-# All ANSI Colors.
-ANSI_CODES = {
-    # Styles.
-    "normal": 0,
-    "bold": 1,
-    "faint": 2,
-    # "italic":       3,
-    "underline": 4,
-    # "blink_slow":   5,
-    # "blink_rapid":  6,
-    "inverse": 7,
-    # "conceal":      8,
-    # "crossed_out":  9
-    # Text colors.
-    "black": 30,
-    "red": 31,
-    "green": 32,
-    "yellow": 33,
-    "blue": 34,
-    "magenta": 35,
-    "cyan": 36,
-    "white": 37,
-    # Background colors.
-    "bg_black": 40,
-    "bg_red": 41,
-    "bg_green": 42,
-    "bg_yellow": 43,
-    "bg_blue": 44,
-    "bg_magenta": 45,
-    "bg_cyan": 46,
-    "bg_white": 47,
-}
-RESET_COLOR = COLOR_ESCAPE + "39;49;00m"
-
-# These abstract COLOR_NAMES are lazily mapped on to the actual color in COLORS
-# as they are defined in the configuration files, see function: colorize
-COLOR_NAMES = [
-    "text_success",
-    "text_warning",
-    "text_error",
-    "text_highlight",
-    "text_highlight_minor",
-    "action_default",
-    "action",
-    # New Colors
-    "text",
-    "text_faint",
-    "import_path",
-    "import_path_items",
-    "action_description",
-    "added",
-    "removed",
-    "changed",
-    "added_highlight",
-    "removed_highlight",
-    "changed_highlight",
-    "text_diff_added",
-    "text_diff_removed",
-    "text_diff_changed",
-]
-COLORS = None
-
-
-def _colorize(color, text):
-    """Returns a string that prints the given text in the given color
-    in a terminal that is ANSI color-aware. The color must be a list of strings
-    from ANSI_CODES.
-    """
-    # Construct escape sequence to be put before the text by iterating
-    # over all "ANSI codes" in `color`.
-    escape = ""
-    for code in color:
-        escape = escape + COLOR_ESCAPE + "%im" % ANSI_CODES[code]
-    return escape + text + RESET_COLOR
-
-
-def colorize(color_name, text):
-    """Colorize text if colored output is enabled. (Like _colorize but
-    conditional.)
-    """
-    if config["ui"]["color"] and "NO_COLOR" not in os.environ:
-        global COLORS
-        if not COLORS:
-            # Read all color configurations and set global variable COLORS.
-            COLORS = dict()
-            for name in COLOR_NAMES:
-                # Convert legacy color definitions (strings) into the new
-                # list-based color definitions. Do this by trying to read the
-                # color definition from the configuration as unicode - if this
-                # is successful, the color definition is a legacy definition
-                # and has to be converted.
-                try:
-                    color_def = config["ui"]["colors"][name].get(str)
-                except (confuse.ConfigTypeError, NameError):
-                    # Normal color definition (type: list of unicode).
-                    color_def = config["ui"]["colors"][name].get(list)
-                else:
-                    # Legacy color definition (type: unicode). Convert.
-                    if color_def in LEGACY_COLORS:
-                        color_def = LEGACY_COLORS[color_def]
-                    else:
-                        raise UserError("no such color %s", color_def)
-                for code in color_def:
-                    if code not in ANSI_CODES.keys():
-                        raise ValueError("no such ANSI code %s", code)
-                COLORS[name] = color_def
-        # In case a 3rd party plugin is still passing the actual color ('red')
-        # instead of the abstract color name ('text_error')
-        color = COLORS.get(color_name)
-        if not color:
-            log.debug("Invalid color_name: {0}", color_name)
-            color = color_name
-        return _colorize(color, text)
-    else:
-        return text
-
-
-def uncolorize(colored_text):
-    """Remove colors from a string."""
-    # Define a regular expression to match ANSI codes.
-    # See: http://stackoverflow.com/a/2187024/1382707
-    # Explanation of regular expression:
-    #     \x1b     - matches ESC character
-    #     \[       - matches opening square bracket
-    #     [;\d]*   - matches a sequence consisting of one or more digits or
-    #                semicola
-    #     [A-Za-z] - matches a letter
-    ansi_code_regex = re.compile(r"\x1b\[[;\d]*[A-Za-z]", re.VERBOSE)
-    # Strip ANSI codes from `colored_text` using the regular expression.
-    text = ansi_code_regex.sub("", colored_text)
-    return text
-
-
-def color_split(colored_text, index):
-    ansi_code_regex = re.compile(r"(\x1b\[[;\d]*[A-Za-z])", re.VERBOSE)
-    length = 0
-    pre_split = ""
-    post_split = ""
-    found_color_code = None
-    found_split = False
-    for part in ansi_code_regex.split(colored_text):
-        # Count how many real letters we have passed
-        length += color_len(part)
-        if found_split:
-            post_split += part
-        else:
-            if ansi_code_regex.match(part):
-                # This is a color code
-                if part == RESET_COLOR:
-                    found_color_code = None
-                else:
-                    found_color_code = part
-                pre_split += part
-            else:
-                if index < length:
-                    # Found part with our split in.
-                    split_index = index - (length - color_len(part))
-                    found_split = True
-                    if found_color_code:
-                        pre_split += part[:split_index] + RESET_COLOR
-                        post_split += found_color_code + part[split_index:]
-                    else:
-                        pre_split += part[:split_index]
-                        post_split += part[split_index:]
-                else:
-                    # Not found, add this part to the pre split
-                    pre_split += part
-    return pre_split, post_split
-
-
-def color_len(colored_text):
-    """Measure the length of a string while excluding ANSI codes from the
-    measurement. The standard `len(my_string)` method also counts ANSI codes
-    to the string length, which is counterproductive when layouting a
-    Terminal interface.
-    """
-    # Return the length of the uncolored string.
-    return len(uncolorize(colored_text))
-
-
-def _colordiff(a, b):
-    """Given two values, return the same pair of strings except with
-    their differences highlighted in the specified color. Strings are
-    highlighted intelligently to show differences; other values are
-    stringified and highlighted in their entirety.
-    """
-    # First, convert paths to readable format
-    if isinstance(a, bytes) or isinstance(b, bytes):
-        # A path field.
-        a = util.displayable_path(a)
-        b = util.displayable_path(b)
-
-    if not isinstance(a, str) or not isinstance(b, str):
-        # Non-strings: use ordinary equality.
-        if a == b:
-            return str(a), str(b)
-        else:
-            return (
-                colorize("text_diff_removed", str(a)),
-                colorize("text_diff_added", str(b)),
-            )
-
-    a_out = []
-    b_out = []
-
-    matcher = SequenceMatcher(lambda x: False, a, b)
-    for op, a_start, a_end, b_start, b_end in matcher.get_opcodes():
-        if op == "equal":
-            # In both strings.
-            a_out.append(a[a_start:a_end])
-            b_out.append(b[b_start:b_end])
-        elif op == "insert":
-            # Right only.
-            b_out.append(colorize("text_diff_added", b[b_start:b_end]))
-        elif op == "delete":
-            # Left only.
-            a_out.append(colorize("text_diff_removed", a[a_start:a_end]))
-        elif op == "replace":
-            # Right and left differ. Colorise with second highlight if
-            # it's just a case change.
-            if a[a_start:a_end].lower() != b[b_start:b_end].lower():
-                a_color = "text_diff_removed"
-                b_color = "text_diff_added"
-            else:
-                a_color = b_color = "text_highlight_minor"
-            a_out.append(colorize(a_color, a[a_start:a_end]))
-            b_out.append(colorize(b_color, b[b_start:b_end]))
-        else:
-            assert False
-
-    return "".join(a_out), "".join(b_out)
-
-
-def colordiff(a, b):
-    """Colorize differences between two values if color is enabled.
-    (Like _colordiff but conditional.)
-    """
-    if config["ui"]["color"]:
-        return _colordiff(a, b)
-    else:
-        return str(a), str(b)
-
-
-def get_path_formats(subview=None):
-    """Get the configuration's path formats as a list of query/template
-    pairs.
-    """
-    path_formats = []
-    subview = subview or config["paths"]
-    for query, view in subview.items():
-        query = PF_KEY_QUERIES.get(query, query)  # Expand common queries.
-        path_formats.append((query, template(view.as_str())))
-    return path_formats
-
-
-def get_replacements():
-    """Confuse validation function that reads regex/string pairs."""
-    replacements = []
-    for pattern, repl in config["replace"].get(dict).items():
-        repl = repl or ""
-        try:
-            replacements.append((re.compile(pattern), repl))
-        except re.error:
-            raise UserError(
-                "malformed regular expression in replace: {}".format(pattern)
-            )
-    return replacements
-
-
-def term_width():
+@cache
+def term_width() -> int:
     """Get the width (columns) of the terminal."""
-    fallback = config["ui"]["terminal_width"].get(int)
-
-    # The fcntl and termios modules are not available on non-Unix
-    # platforms, so we fall back to a constant.
-    try:
-        import fcntl
-        import termios
-    except ImportError:
-        return fallback
-
-    try:
-        buf = fcntl.ioctl(0, termios.TIOCGWINSZ, " " * 4)
-    except OSError:
-        return fallback
-    try:
-        height, width = struct.unpack("hh", buf)
-    except struct.error:
-        return fallback
-    return width
+    columns, _ = shutil.get_terminal_size(fallback=(0, 0))
+    return columns if columns else config["ui"]["terminal_width"].get(int)
 
 
-def split_into_lines(string, width_tuple):
-    """Splits string into a list of substrings at whitespace.
+def show_model_changes(
+    new: library.LibModel,
+    old: library.LibModel | None = None,
+    fields: Iterable[str] | None = None,
+    always: bool = False,
+    print_obj: bool = True,
+) -> bool:
+    """Print a diff of changes between two library model states.
 
-    `width_tuple` is a 3-tuple of `(first_width, last_width, middle_width)`.
-    The first substring has a length not longer than `first_width`, the last
-    substring has a length not longer than `last_width`, and all other
-    substrings have a length not longer than `middle_width`.
-    `string` may contain ANSI codes at word borders.
+    Compares `new` against `old`, falling back to the database version of
+    `new` when `old` is not provided.
+
+    Optionally prints the original object label before listing field-level
+    changes when `print_obj` is enabled. When `always` is set, the object
+    label is printed even if no changes are detected. Returns whether any
+    changes were found.
     """
-    first_width, middle_width, last_width = width_tuple
-    words = []
-    esc_text = re.compile(
-        r"""(?P<pretext>[^\x1b]*)
-                            (?P<esc>(?:\x1b\[[;\d]*[A-Za-z])+)
-                            (?P<text>[^\x1b]+)(?P<reset>\x1b\[39;49;00m)
-                            (?P<posttext>[^\x1b]*)""",
-        re.VERBOSE,
-    )
-    if uncolorize(string) == string:
-        # No colors in string
-        words = string.split()
-    else:
-        # Use a regex to find escapes and the text within them.
-        for m in esc_text.finditer(string):
-            # m contains four groups:
-            # pretext - any text before escape sequence
-            # esc - intitial escape sequence
-            # text - text, no escape sequence, may contain spaces
-            # reset - ASCII colour reset
-            space_before_text = False
-            if m.group("pretext") != "":
-                # Some pretext found, let's handle it
-                # Add any words in the pretext
-                words += m.group("pretext").split()
-                if m.group("pretext")[-1] == " ":
-                    # Pretext ended on a space
-                    space_before_text = True
-                else:
-                    # Pretext ended mid-word, ensure next word
-                    pass
-            else:
-                # pretext empty, treat as if there is a space before
-                space_before_text = True
-            if m.group("text")[0] == " ":
-                # First character of the text is a space
-                space_before_text = True
-            # Now, handle the words in the main text:
-            raw_words = m.group("text").split()
-            if space_before_text:
-                # Colorize each word with pre/post escapes
-                # Reconstruct colored words
-                words += [
-                    m.group("esc") + raw_word + RESET_COLOR
-                    for raw_word in raw_words
-                ]
-            elif raw_words:
-                # Pretext stops mid-word
-                if m.group("esc") != RESET_COLOR:
-                    # Add the rest of the current word, with a reset after it
-                    words[-1] += m.group("esc") + raw_words[0] + RESET_COLOR
-                    # Add the subsequent colored words:
-                    words += [
-                        m.group("esc") + raw_word + RESET_COLOR
-                        for raw_word in raw_words[1:]
-                    ]
-                else:
-                    # Caught a mid-word escape sequence
-                    words[-1] += raw_words[0]
-                    words += raw_words[1:]
-            if (
-                m.group("text")[-1] != " "
-                and m.group("posttext") != ""
-                and m.group("posttext")[0] != " "
-            ):
-                # reset falls mid-word
-                post_text = m.group("posttext").split()
-                words[-1] += post_text[0]
-                words += post_text[1:]
-            else:
-                # Add any words after escape sequence
-                words += m.group("posttext").split()
-    result = []
-    next_substr = ""
-    # Iterate over all words.
-    previous_fit = False
-    for i in range(len(words)):
-        if i == 0:
-            pot_substr = words[i]
-        else:
-            # (optimistically) add the next word to check the fit
-            pot_substr = " ".join([next_substr, words[i]])
-        # Find out if the pot(ential)_substr fits into the next substring.
-        fits_first = len(result) == 0 and color_len(pot_substr) <= first_width
-        fits_middle = len(result) != 0 and color_len(pot_substr) <= middle_width
-        if fits_first or fits_middle:
-            # Fitted(!) let's try and add another word before appending
-            next_substr = pot_substr
-            previous_fit = True
-        elif not fits_first and not fits_middle and previous_fit:
-            # Extra word didn't fit, append what we have
-            result.append(next_substr)
-            next_substr = words[i]
-            previous_fit = color_len(next_substr) <= middle_width
-        else:
-            # Didn't fit anywhere
-            if uncolorize(pot_substr) == pot_substr:
-                # Simple uncolored string, append a cropped word
-                if len(result) == 0:
-                    # Crop word by the first_width for the first line
-                    result.append(pot_substr[:first_width])
-                    # add rest of word to next line
-                    next_substr = pot_substr[first_width:]
-                else:
-                    result.append(pot_substr[:middle_width])
-                    next_substr = pot_substr[middle_width:]
-            else:
-                # Colored strings
-                if len(result) == 0:
-                    this_line, next_line = color_split(pot_substr, first_width)
-                    result.append(this_line)
-                    next_substr = next_line
-                else:
-                    this_line, next_line = color_split(pot_substr, middle_width)
-                    result.append(this_line)
-                    next_substr = next_line
-            previous_fit = color_len(next_substr) <= middle_width
-
-    # We finished constructing the substrings, but the last substring
-    # has not yet been added to the result.
-    result.append(next_substr)
-    # Also, the length of the last substring was only checked against
-    # `middle_width`. Append an empty substring as the new last substring if
-    # the last substring is too long.
-    if not color_len(next_substr) <= last_width:
-        result.append("")
-    return result
-
-
-def print_column_layout(
-    indent_str, left, right, separator=" -> ", max_width=term_width()
-):
-    """Print left & right data, with separator inbetween
-    'left' and 'right' have a structure of:
-    {'prefix':u'','contents':u'','suffix':u'','width':0}
-    In a column layout the printing will be:
-    {indent_str}{lhs0}{separator}{rhs0}
-            {lhs1 / padding }{rhs1}
-            ...
-    The first line of each column (i.e. {lhs0} or {rhs0}) is:
-    {prefix}{part of contents}{suffix}
-    With subsequent lines (i.e. {lhs1}, {rhs1} onwards) being the
-    rest of contents, wrapped if the width would be otherwise exceeded.
-    """
-    if right["prefix"] + right["contents"] + right["suffix"] == "":
-        # No right hand information, so we don't need a separator.
-        separator = ""
-    first_line_no_wrap = (
-        indent_str
-        + left["prefix"]
-        + left["contents"]
-        + left["suffix"]
-        + separator
-        + right["prefix"]
-        + right["contents"]
-        + right["suffix"]
-    )
-    if color_len(first_line_no_wrap) < max_width:
-        # Everything fits, print out line.
-        print_(first_line_no_wrap)
-    else:
-        # Wrap into columns
-        if "width" not in left or "width" not in right:
-            # If widths have not been defined, set to share space.
-            left["width"] = (
-                max_width - len(indent_str) - color_len(separator)
-            ) // 2
-            right["width"] = (
-                max_width - len(indent_str) - color_len(separator)
-            ) // 2
-        # On the first line, account for suffix as well as prefix
-        left_width_tuple = (
-            left["width"]
-            - color_len(left["prefix"])
-            - color_len(left["suffix"]),
-            left["width"] - color_len(left["prefix"]),
-            left["width"] - color_len(left["prefix"]),
-        )
-
-        left_split = split_into_lines(left["contents"], left_width_tuple)
-        right_width_tuple = (
-            right["width"]
-            - color_len(right["prefix"])
-            - color_len(right["suffix"]),
-            right["width"] - color_len(right["prefix"]),
-            right["width"] - color_len(right["prefix"]),
-        )
-
-        right_split = split_into_lines(right["contents"], right_width_tuple)
-        max_line_count = max(len(left_split), len(right_split))
-
-        out = ""
-        for i in range(max_line_count):
-            # indentation
-            out += indent_str
-
-            # Prefix or indent_str for line
-            if i == 0:
-                out += left["prefix"]
-            else:
-                out += indent(color_len(left["prefix"]))
-
-            # Line i of left hand side contents.
-            if i < len(left_split):
-                out += left_split[i]
-                left_part_len = color_len(left_split[i])
-            else:
-                left_part_len = 0
-
-            # Padding until end of column.
-            # Note: differs from original
-            # column calcs in not -1 afterwards for space
-            # in track number as that is included in 'prefix'
-            padding = left["width"] - color_len(left["prefix"]) - left_part_len
-
-            # Remove some padding on the first line to display
-            # length
-            if i == 0:
-                padding -= color_len(left["suffix"])
-
-            out += indent(padding)
-
-            if i == 0:
-                out += left["suffix"]
-
-            # Separator between columns.
-            if i == 0:
-                out += separator
-            else:
-                out += indent(color_len(separator))
-
-            # Right prefix, contents, padding, suffix
-            if i == 0:
-                out += right["prefix"]
-            else:
-                out += indent(color_len(right["prefix"]))
-
-            # Line i of right hand side.
-            if i < len(right_split):
-                out += right_split[i]
-                right_part_len = color_len(right_split[i])
-            else:
-                right_part_len = 0
-
-            # Padding until end of column
-            padding = (
-                right["width"] - color_len(right["prefix"]) - right_part_len
-            )
-            # Remove some padding on the first line to display
-            # length
-            if i == 0:
-                padding -= color_len(right["suffix"])
-            out += indent(padding)
-            # Length in first line
-            if i == 0:
-                out += right["suffix"]
-
-            # Linebreak, except in the last line.
-            if i < max_line_count - 1:
-                out += "\n"
-
-        # Constructed all of the columns, now print
-        print_(out)
-
-
-def print_newline_layout(
-    indent_str, left, right, separator=" -> ", max_width=term_width()
-):
-    """Prints using a newline separator between left & right if
-    they go over their allocated widths. The datastructures are
-    shared with the column layout. In contrast to the column layout,
-    the prefix and suffix are printed at the beginning and end of
-    the contents. If no wrapping is required (i.e. everything fits) the
-    first line will look exactly the same as the column layout:
-    {indent}{lhs0}{separator}{rhs0}
-    However if this would go over the width given, the layout now becomes:
-    {indent}{lhs0}
-    {indent}{separator}{rhs0}
-    If {lhs0} would go over the maximum width, the subsequent lines are
-    indented a second time for ease of reading.
-    """
-    if right["prefix"] + right["contents"] + right["suffix"] == "":
-        # No right hand information, so we don't need a separator.
-        separator = ""
-    first_line_no_wrap = (
-        indent_str
-        + left["prefix"]
-        + left["contents"]
-        + left["suffix"]
-        + separator
-        + right["prefix"]
-        + right["contents"]
-        + right["suffix"]
-    )
-    if color_len(first_line_no_wrap) < max_width:
-        # Everything fits, print out line.
-        print_(first_line_no_wrap)
-    else:
-        # Newline separation, with wrapping
-        empty_space = max_width - len(indent_str)
-        # On lower lines we will double the indent for clarity
-        left_width_tuple = (
-            empty_space,
-            empty_space - len(indent_str),
-            empty_space - len(indent_str),
-        )
-        left_str = left["prefix"] + left["contents"] + left["suffix"]
-        left_split = split_into_lines(left_str, left_width_tuple)
-        # Repeat calculations for rhs, including separator on first line
-        right_width_tuple = (
-            empty_space - color_len(separator),
-            empty_space - len(indent_str),
-            empty_space - len(indent_str),
-        )
-        right_str = right["prefix"] + right["contents"] + right["suffix"]
-        right_split = split_into_lines(right_str, right_width_tuple)
-        for i, line in enumerate(left_split):
-            if i == 0:
-                print_(indent_str + line)
-            elif line != "":
-                # Ignore empty lines
-                print_(indent_str * 2 + line)
-        for i, line in enumerate(right_split):
-            if i == 0:
-                print_(indent_str + separator + line)
-            elif line != "":
-                print_(indent_str * 2 + line)
-
-
-FLOAT_EPSILON = 0.01
-
-
-def _field_diff(field, old, old_fmt, new, new_fmt):
-    """Given two Model objects and their formatted views, format their values
-    for `field` and highlight changes among them. Return a human-readable
-    string. If the value has not changed, return None instead.
-    """
-    oldval = old.get(field)
-    newval = new.get(field)
-
-    # If no change, abort.
-    if (
-        isinstance(oldval, float)
-        and isinstance(newval, float)
-        and abs(oldval - newval) < FLOAT_EPSILON
-    ):
-        return None
-    elif oldval == newval:
-        return None
-
-    # Get formatted values for output.
-    oldstr = old_fmt.get(field, "")
-    newstr = new_fmt.get(field, "")
-
-    # For strings, highlight changes. For others, colorize the whole
-    # thing.
-    if isinstance(oldval, str):
-        oldstr, newstr = colordiff(oldval, newstr)
-    else:
-        oldstr = colorize("text_error", oldstr)
-        newstr = colorize("text_error", newstr)
-
-    return f"{oldstr} -> {newstr}"
-
-
-def show_model_changes(new, old=None, fields=None, always=False):
-    """Given a Model object, print a list of changes from its pristine
-    version stored in the database. Return a boolean indicating whether
-    any changes were found.
-
-    `old` may be the "original" object to avoid using the pristine
-    version from the database. `fields` may be a list of fields to
-    restrict the detection to. `always` indicates whether the object is
-    always identified, regardless of whether any changes are present.
-    """
-    old = old or new._db._get(type(new), new.id)
-
-    # Keep the formatted views around instead of re-creating them in each
-    # iteration step
-    old_fmt = old.formatted()
-    new_fmt = new.formatted()
-
-    # Build up lines showing changed fields.
-    changes = []
-    for field in old:
-        # Subset of the fields. Never show mtime.
-        if field == "mtime" or (fields and field not in fields):
-            continue
-
-        # Detect and show difference for this field.
-        line = _field_diff(field, old, old_fmt, new, new_fmt)
-        if line:
-            changes.append(f"  {field}: {line}")
-
-    # New fields.
-    for field in set(new) - set(old):
-        if fields and field not in fields:
-            continue
-
-        changes.append(
-            "  {}: {}".format(field, colorize("text_highlight", new_fmt[field]))
-        )
+    old = old or new.get_fresh_from_db()
+    changes = get_model_changes(new, old, fields)
 
     # Print changes.
-    if changes or always:
+    if print_obj and (changes or always):
         print_(format(old))
     if changes:
-        print_("\n".join(changes))
+        print_(textwrap.indent("\n".join(changes), "  "))
 
     return bool(changes)
 
 
-def show_path_changes(path_changes):
-    """Given a list of tuples (source, destination) that indicate the
-    path changes, log the changes as INFO-level output to the beets log.
-    The output is guaranteed to be unicode.
-
-    Every pair is shown on a single line if the terminal width permits it,
-    else it is split over two lines. E.g.,
-
-    Source -> Destination
-
-    vs.
-
-    Source
-      -> Destination
-    """
-    sources, destinations = zip(*path_changes)
-
-    # Ensure unicode output
-    sources = list(map(util.displayable_path, sources))
-    destinations = list(map(util.displayable_path, destinations))
-
-    # Calculate widths for terminal split
-    col_width = (term_width() - len(" -> ")) // 2
-    max_width = len(max(sources + destinations, key=len))
-
-    if max_width > col_width:
-        # Print every change over two lines
-        for source, dest in zip(sources, destinations):
-            color_source, color_dest = colordiff(source, dest)
-            print_("{0} \n  -> {1}".format(color_source, color_dest))
-    else:
-        # Print every change on a single line, and add a header
-        title_pad = max_width - len("Source ") + len(" -> ")
-
-        print_("Source {0} Destination".format(" " * title_pad))
-        for source, dest in zip(sources, destinations):
-            pad = max_width - len(source)
-            color_source, color_dest = colordiff(source, dest)
-            print_(
-                "{0} {1} -> {2}".format(
-                    color_source,
-                    " " * pad,
-                    color_dest,
-                )
-            )
-
-
 # Helper functions for option parsing.
-
-
-def _store_dict(option, opt_str, value, parser):
-    """Custom action callback to parse options which have ``key=value``
-    pairs as values. All such pairs passed for this option are
-    aggregated into a dictionary.
-    """
-    dest = option.dest
-    option_values = getattr(parser.values, dest, None)
-
-    if option_values is None:
-        # This is the first supplied ``key=value`` pair of option.
-        # Initialize empty dictionary and get a reference to it.
-        setattr(parser.values, dest, {})
-        option_values = getattr(parser.values, dest)
-
-    try:
-        key, value = value.split("=", 1)
-        if not (key and value):
-            raise ValueError
-    except ValueError:
-        raise UserError(
-            "supplied argument `{}' is not of the form `key=value'".format(
-                value
-            )
-        )
-
-    option_values[key] = value
 
 
 class CommonOptionsParser(optparse.OptionParser):
@@ -1317,14 +492,18 @@ class CommonOptionsParser(optparse.OptionParser):
     Each method is fully documented in the related method.
     """
 
-    def __init__(self, *args, **kwargs):
+    _album_flags: set[str] | Literal[False]
+
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._album_flags = False
         # this serves both as an indicator that we offer the feature AND allows
         # us to check whether it has been specified on the CLI - bypassing the
         # fact that arguments may be in any order
 
-    def add_album_option(self, flags=("-a", "--album")):
+    def add_album_option(
+        self, flags: Sequence[str] = ("-a", "--album")
+    ) -> None:
         """Add a -a/--album option to match albums instead of tracks.
 
         If used then the format option can auto-detect whether we're setting
@@ -1332,45 +511,43 @@ class CommonOptionsParser(optparse.OptionParser):
         Sets the album property on the options extracted from the CLI.
         """
         album = optparse.Option(
-            *flags, action="store_true", help="match albums instead of tracks"
+            *flags,
+            action="store_true",
+            default=False,
+            help="match albums instead of tracks",
         )
         self.add_option(album)
         self._album_flags = set(flags)
 
     def _set_format(
         self,
-        option,
-        opt_str,
-        value,
-        parser,
-        target=None,
-        fmt=None,
-        store_true=False,
-    ):
+        option: optparse.Option,
+        opt_str: str,
+        value: str,
+        parser: SubcommandsOptionParser,
+        target: type[LibModel] | None = None,
+        fmt: str | None = None,
+        store_true: bool = False,
+    ) -> None:
         """Internal callback that sets the correct format while parsing CLI
         arguments.
         """
         if store_true:
-            setattr(parser.values, option.dest, True)
+            setattr(parser.values, option.dest, True)  # type: ignore[arg-type]
 
         # Use the explicitly specified format, or the string from the option.
-        if fmt:
-            value = fmt
-        elif value:
-            (value,) = decargs([value])
-        else:
-            value = ""
+        value = fmt or value or ""
+        parser.values.format = value  # type: ignore[union-attr]
 
-        parser.values.format = value
         if target:
             config[target._format_config_key].set(value)
         else:
             if self._album_flags:
-                if parser.values.album:
+                if parser.values.album:  # type: ignore[union-attr]
                     target = library.Album
                 else:
                     # the option is either missing either not parsed yet
-                    if self._album_flags & set(parser.rargs):
+                    if self._album_flags & set(parser.rargs or []):
                         target = library.Album
                     else:
                         target = library.Item
@@ -1379,7 +556,7 @@ class CommonOptionsParser(optparse.OptionParser):
                 config[library.Item._format_config_key].set(value)
                 config[library.Album._format_config_key].set(value)
 
-    def add_path_option(self, flags=("-p", "--path")):
+    def add_path_option(self, flags: Sequence[str] = ("-p", "--path")) -> None:
         """Add a -p/--path option to display the path instead of the default
         format.
 
@@ -1399,7 +576,11 @@ class CommonOptionsParser(optparse.OptionParser):
         )
         self.add_option(path)
 
-    def add_format_option(self, flags=("-f", "--format"), target=None):
+    def add_format_option(
+        self,
+        flags: Sequence[str] = ("-f", "--format"),
+        target: type[LibModel] | Literal["item", "album"] | None = None,
+    ) -> None:
         """Add -f/--format option to print some LibModel instances with a
         custom format.
 
@@ -1416,9 +597,11 @@ class CommonOptionsParser(optparse.OptionParser):
         """
         kwargs = {}
         if target:
-            if isinstance(target, str):
-                target = {"item": library.Item, "album": library.Album}[target]
-            kwargs["target"] = target
+            kwargs["target"] = (
+                {"item": library.Item, "album": library.Album}[target]
+                if isinstance(target, str)
+                else target
+            )
 
         opt = optparse.Option(
             *flags,
@@ -1429,7 +612,7 @@ class CommonOptionsParser(optparse.OptionParser):
         )
         self.add_option(opt)
 
-    def add_all_common_options(self):
+    def add_all_common_options(self) -> None:
         """Add album, path and format options."""
         self.add_album_option()
         self.add_path_option()
@@ -1450,9 +633,17 @@ class Subcommand:
     invoked by a SubcommandOptionParser.
     """
 
-    func: Callable[[library.Library, optparse.Values, list[str]], Any]
+    func: Callable[[library.Library, Any, list[str]], Any]
+    _root_parser: optparse.OptionParser | None
 
-    def __init__(self, name, parser=None, help="", aliases=(), hide=False):
+    def __init__(
+        self,
+        name: str,
+        parser: CommonOptionsParser | None = None,
+        help: str = "",  # noqa: A002
+        aliases: Sequence[str] = (),
+        hide: bool = False,
+    ) -> None:
         """Creates a new subcommand. name is the primary way to invoke
         the subcommand; aliases are alternate names. parser is an
         OptionParser responsible for parsing the subcommand's options.
@@ -1466,21 +657,21 @@ class Subcommand:
         self.hide = hide
         self._root_parser = None
 
-    def print_help(self):
+    def print_help(self) -> None:
         self.parser.print_help()
 
-    def parse_args(self, args):
+    def parse_args(self, args: list[str]) -> tuple[optparse.Values, list[str]]:
         return self.parser.parse_args(args)
 
     @property
-    def root_parser(self):
+    def root_parser(self) -> optparse.OptionParser | None:
         return self._root_parser
 
     @root_parser.setter
-    def root_parser(self, root_parser):
+    def root_parser(self, root_parser: optparse.OptionParser) -> None:
         self._root_parser = root_parser
-        self.parser.prog = "{} {}".format(
-            as_string(root_parser.get_prog_name()), self.name
+        self.parser.prog = (
+            f"{as_string(root_parser.get_prog_name())} {self.name}"
         )
 
 
@@ -1489,7 +680,9 @@ class SubcommandsOptionParser(CommonOptionsParser):
     arguments.
     """
 
-    def __init__(self, *args, **kwargs):
+    subcommands: list[Subcommand]
+
+    def __init__(self, *args, **kwargs) -> None:
         """Create a new subcommand-aware option parser. All of the
         options to OptionParser.__init__ are supported in addition
         to subcommands, a sequence of Subcommand objects.
@@ -1509,14 +702,16 @@ class SubcommandsOptionParser(CommonOptionsParser):
 
         self.subcommands = []
 
-    def add_subcommand(self, *cmds):
+    def add_subcommand(self, *cmds) -> None:
         """Adds a Subcommand object to the parser's list of commands."""
         for cmd in cmds:
             cmd.root_parser = self
             self.subcommands.append(cmd)
 
     # Add the list of subcommands to the help message.
-    def format_help(self, formatter=None):
+    def format_help(
+        self, formatter: optparse.HelpFormatter | None = None
+    ) -> str:
         # Get the original help message, to which we will append.
         out = super().format_help(formatter)
         if formatter is None:
@@ -1536,7 +731,7 @@ class SubcommandsOptionParser(CommonOptionsParser):
         for subcommand in subcommands:
             name = subcommand.name
             if subcommand.aliases:
-                name += " (%s)" % ", ".join(subcommand.aliases)
+                name += f" ({', '.join(subcommand.aliases)})"
             disp_names.append(name)
 
             # Set the help position based on the max width.
@@ -1549,34 +744,26 @@ class SubcommandsOptionParser(CommonOptionsParser):
             # Lifted directly from optparse.py.
             name_width = help_position - formatter.current_indent - 2
             if len(name) > name_width:
-                name = "%*s%s\n" % (formatter.current_indent, "", name)
+                name = f"{' ' * formatter.current_indent}{name}\n"
                 indent_first = help_position
             else:
-                name = "%*s%-*s  " % (
-                    formatter.current_indent,
-                    "",
-                    name_width,
-                    name,
-                )
+                name = f"{' ' * formatter.current_indent}{name:<{name_width}}  "
                 indent_first = 0
             result.append(name)
             help_width = formatter.width - help_position
             help_lines = textwrap.wrap(subcommand.help, help_width)
             help_line = help_lines[0] if help_lines else ""
-            result.append("%*s%s\n" % (indent_first, "", help_line))
+            result.append(f"{' ' * indent_first}{help_line}\n")
             result.extend(
-                [
-                    "%*s%s\n" % (help_position, "", line)
-                    for line in help_lines[1:]
-                ]
+                [f"{' ' * help_position}{line}\n" for line in help_lines[1:]]
             )
         formatter.dedent()
 
         # Concatenate the original help message with the subcommand
         # list.
-        return out + "".join(result)
+        return f"{out}{''.join(result)}"
 
-    def _subcommand_for_name(self, name):
+    def _subcommand_for_name(self, name: str) -> Subcommand | None:
         """Return the subcommand in self.subcommands matching the
         given name. The name may either be the name of a subcommand or
         an alias. If no subcommand matches, returns None.
@@ -1586,7 +773,9 @@ class SubcommandsOptionParser(CommonOptionsParser):
                 return subcommand
         return None
 
-    def parse_global_options(self, args):
+    def parse_global_options(
+        self, args: list[str] | None
+    ) -> tuple[optparse.Values, list[str]]:
         """Parse options up to the subcommand argument. Returns a tuple
         of the options object and the remaining arguments.
         """
@@ -1599,7 +788,9 @@ class SubcommandsOptionParser(CommonOptionsParser):
             subargs = ["version"]
         return options, subargs
 
-    def parse_subcommand(self, args):
+    def parse_subcommand(
+        self, args: list[str]
+    ) -> tuple[Subcommand, optparse.Values, list[str]]:
         """Given the `args` left unused by a `parse_global_options`,
         return the invoked subcommand, the subcommand options, and the
         subcommand arguments.
@@ -1623,66 +814,13 @@ optparse.Option.ALWAYS_TYPED_ACTIONS += ("callback",)
 # The main entry point and bootstrapping.
 
 
-def _load_plugins(options, config):
-    """Load the plugins specified on the command line or in the configuration."""
-    paths = config["pluginpath"].as_str_seq(split=False)
-    paths = [util.normpath(p) for p in paths]
-    log.debug("plugin paths: {0}", util.displayable_path(paths))
-
-    # On Python 3, the search paths need to be unicode.
-    paths = [os.fsdecode(p) for p in paths]
-
-    # Extend the `beetsplug` package to include the plugin paths.
-    import beetsplug
-
-    beetsplug.__path__ = paths + list(beetsplug.__path__)
-
-    # For backwards compatibility, also support plugin paths that
-    # *contain* a `beetsplug` package.
-    sys.path += paths
-
-    # If we were given any plugins on the command line, use those.
-    if options.plugins is not None:
-        plugin_list = (
-            options.plugins.split(",") if len(options.plugins) > 0 else []
-        )
-    else:
-        plugin_list = config["plugins"].as_str_seq()
-
-    # Exclude any plugins that were specified on the command line
-    if options.exclude is not None:
-        plugin_list = [
-            p for p in plugin_list if p not in options.exclude.split(",")
-        ]
-
-    plugins.load_plugins(plugin_list)
-    return plugins
-
-
-def _setup(options, lib=None):
+def _setup() -> tuple[list[Subcommand], library.Library]:
     """Prepare and global state and updates it with command line options.
 
     Returns a list of subcommands, a list of plugins, and a library instance.
     """
-    # Configure the MusicBrainz API.
-    mb.configure()
 
-    config = _configure(options)
-
-    plugins = _load_plugins(options, config)
-
-    # Add types and queries defined by plugins.
-    plugin_types_album = plugins.types(library.Album)
-    library.Album._types.update(plugin_types_album)
-    item_types = plugin_types_album.copy()
-    item_types.update(library.Item._types)
-    item_types.update(plugins.types(library.Item))
-    library.Item._types = item_types
-
-    library.Item._queries.update(plugins.named_queries(library.Item))
-    library.Album._queries.update(plugins.named_queries(library.Album))
-
-    plugins.send("pluginload")
+    plugins.load_plugins()
 
     # Get the default subcommands.
     from beets.ui.commands import default_commands
@@ -1690,92 +828,49 @@ def _setup(options, lib=None):
     subcommands = list(default_commands)
     subcommands.extend(plugins.commands())
 
-    if lib is None:
-        lib = _open_library(config)
-        plugins.send("library_opened", lib=lib)
+    lib = _open_library(config)
+    plugins.send("library_opened", lib=lib)
 
-    return subcommands, plugins, lib
-
-
-def _configure(options):
-    """Amend the global configuration object with command line options."""
-    # Add any additional config files specified with --config. This
-    # special handling lets specified plugins get loaded before we
-    # finish parsing the command line.
-    if getattr(options, "config", None) is not None:
-        overlay_path = options.config
-        del options.config
-        config.set_file(overlay_path)
-    else:
-        overlay_path = None
-    config.set_args(options)
-
-    # Configure the logger.
-    if config["verbose"].get(int):
-        log.set_global_level(logging.DEBUG)
-    else:
-        log.set_global_level(logging.INFO)
-
-    if overlay_path:
-        log.debug(
-            "overlaying configuration: {0}", util.displayable_path(overlay_path)
-        )
-
-    config_path = config.user_config_path()
-    if os.path.isfile(config_path):
-        log.debug("user configuration: {0}", util.displayable_path(config_path))
-    else:
-        log.debug(
-            "no user configuration found at {0}",
-            util.displayable_path(config_path),
-        )
-
-    log.debug("data directory: {0}", util.displayable_path(config.config_dir()))
-    return config
+    return subcommands, lib
 
 
-def _ensure_db_directory_exists(path):
-    if path == b":memory:":  # in memory db
+def _ensure_db_directory_exists(path: Path) -> None:
+    dbpath = os.fspath(path)
+    if dbpath in (":memory:", b":memory:"):  # in memory db
         return
-    newpath = os.path.dirname(path)
+    newpath = os.path.dirname(dbpath)
+    if not newpath:
+        return
     if not os.path.isdir(newpath):
         if input_yn(
-            "The database directory {} does not \
-                       exist. Create it (Y/n)?".format(
-                util.displayable_path(newpath)
-            )
+            f"The database directory {util.displayable_path(newpath)} does not"
+            " exist. Create it (Y/n)?"
         ):
             os.makedirs(newpath)
 
 
-def _open_library(config):
+def _open_library(config: confuse.LazyConfig) -> library.Library:
     """Create a new library instance from the configuration."""
-    dbpath = util.bytestring_path(config["library"].as_filename())
+    dbpath = config["library"].as_path()
     _ensure_db_directory_exists(dbpath)
     try:
-        lib = library.Library(
-            dbpath,
-            config["directory"].as_filename(),
-            get_path_formats(),
-            get_replacements(),
-        )
+        lib = library.Library(dbpath, config["directory"].as_filename())
         lib.get_item(0)  # Test database connection.
     except (sqlite3.OperationalError, sqlite3.DatabaseError) as db_error:
         log.debug("{}", traceback.format_exc())
         raise UserError(
-            "database file {} cannot not be opened: {}".format(
-                util.displayable_path(dbpath), db_error
-            )
+            f"database file {util.displayable_path(dbpath)} cannot not be"
+            f" opened: {db_error}"
         )
     log.debug(
-        "library database: {0}\n" "library directory: {1}",
+        "library database: {}\nlibrary directory: {}",
         util.displayable_path(lib.path),
         util.displayable_path(lib.directory),
     )
     return lib
 
 
-def _raw_main(args, lib=None):
+def _raw_main(args: list[str] | None) -> None:
     """A helper function for `main` without top-level exception
     handling.
     """
@@ -1801,16 +896,31 @@ def _raw_main(args, lib=None):
     parser.add_option(
         "-c", "--config", dest="config", help="path to configuration file"
     )
+
+    def parse_csl_callback(
+        option: optparse.Option, _, value: str, parser: SubcommandsOptionParser
+    ) -> None:
+        """Parse a comma-separated list of values."""
+        setattr(
+            parser.values,
+            option.dest,  # type: ignore[arg-type]
+            list(filter(None, value.split(","))),
+        )
+
     parser.add_option(
         "-p",
         "--plugins",
         dest="plugins",
+        action="callback",
+        callback=parse_csl_callback,
         help="a comma-separated list of plugins to load",
     )
     parser.add_option(
         "-P",
         "--disable-plugins",
-        dest="exclude",
+        dest="disabled_plugins",
+        action="callback",
+        callback=parse_csl_callback,
         help="a comma-separated list of plugins to disable",
     )
     parser.add_option(
@@ -1829,48 +939,102 @@ def _raw_main(args, lib=None):
 
     options, subargs = parser.parse_global_options(args)
 
-    # Special case for the `config --edit` command: bypass _setup so
-    # that an invalid configuration does not prevent the editor from
-    # starting.
+    # Defer config errors such that logging is available early for error reporting
+    # also allows `config --edit` command to bypass on config errors
+    deferred_error = _bootstrap_config(options)
+    _bootstrap_logging()
+
     if (
         subargs
         and subargs[0] == "config"
         and ("-e" in subargs or "--edit" in subargs)
     ):
-        from beets.ui.commands import config_edit
+        from beets.ui.commands.config import config_edit
 
-        return config_edit()
+        return config_edit(options)
 
-    test_lib = bool(lib)
-    subcommands, plugins, lib = _setup(options, lib)
+    if "AppData\\Local\\Microsoft\\WindowsApps" in sys.exec_prefix:
+        raise UserError(
+            "beets is unable to use the Microsoft Store version of "
+            "Python. Please install Python from https://python.org.\n"
+            "More details can be found here "
+            "https://beets.readthedocs.io/en/stable/guides/main.html"
+        )
+
+    if deferred_error:
+        raise deferred_error
+
+    subcommands, lib = _setup()
     parser.add_subcommand(*subcommands)
 
     subcommand, suboptions, subargs = parser.parse_subcommand(subargs)
     subcommand.func(lib, suboptions, subargs)
 
     plugins.send("cli_exit", lib=lib)
-    if not test_lib:
-        # Clean up the library unless it came from the test harness.
-        lib._close()
+    lib._close()
+    return None
 
 
-def main(args=None):
+def _bootstrap_config(options: optparse.Values) -> confuse.ConfigError | None:
+    """Apply CLI to config, return error as value if any."""
+
+    deferred_error: confuse.ConfigError | None = None
+    try:
+        # Explicit read() so we own error handling (a broken user config file would
+        # otherwise surface on the first implicit config access e.g. config["verbose"].
+        # It also ensures confuse's source list is populated before set_file() adds the
+        #  --config overlay.
+        config.read()
+        if overlay_path := getattr(options, "config", None):
+            config.set_file(overlay_path)
+    except confuse.ConfigError as e:
+        deferred_error = e
+        # Ensure defaults are loaded even when user config is broken,
+        # so that logging and other subsystems can read basic settings.
+        config.read(user=False, defaults=True)
+
+    # Even if the earlier config loading fails we seperatly try to set the
+    # cli options
+    try:
+        config.set_args(options)
+    except confuse.ConfigError as e:
+        deferred_error = e
+
+    return deferred_error
+
+
+def _get_logging_handler() -> logging.Handler:
+    return logging.StreamHandler()
+
+
+def _bootstrap_logging() -> None:
+    if not log.handlers:
+        handler = _get_logging_handler()
+        handler.setFormatter(
+            logging.LegacyFormatter("%(legacy_prefix)s%(message)s")
+        )
+        log.addHandler(handler)
+
+    # Verbosity level set via cli --verbose.
+    if config["verbose"].get(int):
+        log.set_global_level(logging.DEBUG)
+    else:
+        log.set_global_level(logging.INFO)
+
+    # List configuration sources for user convenience.
+    config.log_sources(log)
+    log.debug("data directory: {}", util.displayable_path(config.config_dir()))
+
+
+def main(args: list[str] | None = None) -> None:
     """Run the main command-line interface for beets. Includes top-level
     exception handlers that print friendly error messages.
     """
-    if "AppData\\Local\\Microsoft\\WindowsApps" in sys.exec_prefix:
-        log.error(
-            "error: beets is unable to use the Microsoft Store version of "
-            "Python. Please install Python from https://python.org.\n"
-            "error: More details can be found here "
-            "https://beets.readthedocs.io/en/stable/guides/main.html"
-        )
-        sys.exit(1)
     try:
         _raw_main(args)
     except UserError as exc:
         message = exc.args[0] if exc.args else None
-        log.error("error: {0}", message)
+        log.error("error: {}", message)
         sys.exit(1)
     except util.HumanReadableError as exc:
         exc.log(log)
@@ -1882,10 +1046,10 @@ def main(args=None):
         log.error("{}", exc)
         sys.exit(1)
     except confuse.ConfigError as exc:
-        log.error("configuration error: {0}", exc)
+        log.error("configuration error: {}", exc)
         sys.exit(1)
     except db_query.InvalidQueryError as exc:
-        log.error("invalid query: {0}", exc)
+        log.error("invalid query: {}", exc)
         sys.exit(1)
     except OSError as exc:
         if exc.errno == errno.EPIPE:
@@ -1898,7 +1062,7 @@ def main(args=None):
         log.debug("{}", traceback.format_exc())
     except db.DBAccessError as exc:
         log.error(
-            "database access error: {0}\n"
+            "database access error: {}\n"
             "the library file might have a permissions problem",
             exc,
         )

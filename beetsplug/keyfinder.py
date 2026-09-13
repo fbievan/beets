@@ -1,54 +1,46 @@
-# This file is part of beets.
-# Copyright 2016, Thomas Scholtes.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """Uses the `KeyFinder` program to add the `initial_key` field."""
+
+from __future__ import annotations
 
 import os.path
 import subprocess
+from typing import TYPE_CHECKING
 
 from beets import ui, util
 from beets.plugins import BeetsPlugin
 
+if TYPE_CHECKING:
+    import optparse
+    from collections.abc import Sequence
+
+    from beets.importer import ImportSession, ImportTask
+    from beets.library import Item, Library
+
 
 class KeyFinderPlugin(BeetsPlugin):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.config.add(
-            {
-                "bin": "KeyFinder",
-                "auto": True,
-                "overwrite": False,
-            }
-        )
+        self.config.add({"bin": "KeyFinder", "auto": True, "overwrite": False})
 
         if self.config["auto"].get(bool):
             self.import_stages = [self.imported]
 
-    def commands(self):
+    def commands(self) -> list[ui.Subcommand]:
         cmd = ui.Subcommand(
             "keyfinder", help="detect and add initial key from audio"
         )
         cmd.func = self.command
         return [cmd]
 
-    def command(self, lib, opts, args):
-        self.find_key(lib.items(ui.decargs(args)), write=ui.should_write())
+    def command(
+        self, lib: Library, opts: optparse.Values, args: list[str]
+    ) -> None:
+        self.find_key(lib.items(args), write=ui.should_write())
 
-    def imported(self, session, task):
+    def imported(self, session: ImportSession, task: ImportTask) -> None:
         self.find_key(task.imported_items())
 
-    def find_key(self, items, write=False):
+    def find_key(self, items: Sequence[Item], write: bool = False) -> None:
         overwrite = self.config["overwrite"].get(bool)
         command = [self.config["bin"].as_str()]
         # The KeyFinder GUI program needs the -f flag before the path.
@@ -62,10 +54,10 @@ class KeyFinderPlugin(BeetsPlugin):
 
             try:
                 output = util.command_output(
-                    command + [util.syspath(item.path)]
+                    [*command, util.syspath(item.path)]
                 ).stdout
             except (subprocess.CalledProcessError, OSError) as exc:
-                self._log.error("execution failed: {0}", exc)
+                self._log.error("execution failed: {}", exc)
                 continue
 
             try:
@@ -73,7 +65,7 @@ class KeyFinderPlugin(BeetsPlugin):
             except IndexError:
                 # Sometimes keyfinder-cli returns 0 but with no key, usually
                 # when the file is silent or corrupt, so we log and skip.
-                self._log.error("no key returned for path: {0}", item.path)
+                self._log.error("no key returned for path: {.path}", item)
                 continue
 
             try:
@@ -84,9 +76,7 @@ class KeyFinderPlugin(BeetsPlugin):
 
             item["initial_key"] = key
             self._log.info(
-                "added computed initial key {0} for {1}",
-                key,
-                util.displayable_path(item.path),
+                "added computed initial key {} for {.filepath}", key, item
             )
 
             if write:

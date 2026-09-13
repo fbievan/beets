@@ -1,34 +1,23 @@
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """Representation of type information for DBCore model fields."""
 
 from __future__ import annotations
 
+import re
+import time
 import typing
 from abc import ABC
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, cast
 
-from beets.util import str2bool
+import beets
+from beets import util
+from beets.util.units import human_seconds_short, raw_seconds_short
 
-from .query import (
-    BooleanQuery,
-    FieldQueryType,
-    NumericQuery,
-    SQLiteType,
-    SubstringQuery,
-)
+from . import pathutils, query
+
+SQLiteType = query.SQLiteType
+BLOB_TYPE = query.BLOB_TYPE
+MULTI_VALUE_DELIMITER = "\\␀"
 
 
 class ModelType(typing.Protocol):
@@ -37,7 +26,7 @@ class ModelType(typing.Protocol):
     given type.
     """
 
-    def __init__(self, value: Any = None): ...
+    def __init__(self, value: Any = None) -> None: ...
 
 
 # Generic type variables, used for the value type T and null type N (if
@@ -61,10 +50,12 @@ class Type(ABC, Generic[T, N]):
     """The SQLite column type for the value.
     """
 
-    query: FieldQueryType = SubstringQuery
+    query: query.FieldQueryType = query.SubstringQuery
     """The `Query` subclass to be used when querying the field.
     """
 
+    # For sequence-like types, keep ``model_type`` unsubscripted as it's used
+    # for ``isinstance`` checks. Use ``list`` instead of ``list[str]``
     model_type: type[T]
     """The Python type that is used to represent the value in the model.
 
@@ -90,10 +81,9 @@ class Type(ABC, Generic[T, N]):
         # `self.null` might be `None`
         if value is None:
             return ""
-        elif isinstance(value, bytes):
+        if isinstance(value, bytes):
             return value.decode("utf-8", "ignore")
-        else:
-            return str(value)
+        return str(value)
 
     def parse(self, string: str) -> T | N:
         """Parse a (possibly human-written) string and return the
@@ -112,10 +102,9 @@ class Type(ABC, Generic[T, N]):
         # TYPING ERROR
         if value is None:
             return self.null
-        else:
-            # TODO This should eventually be replaced by
-            # `self.model_type(value)`
-            return cast(T, value)
+        # TODO This should eventually be replaced by
+        # `self.model_type(value)`
+        return cast(T, value)
 
     def from_sql(self, sql_value: SQLiteType) -> T | N:
         """Receives the value stored in the SQL backend and return the
@@ -135,8 +124,7 @@ class Type(ABC, Generic[T, N]):
             sql_value = bytes(sql_value).decode("utf-8", "ignore")
         if isinstance(sql_value, str):
             return self.parse(sql_value)
-        else:
-            return self.normalize(sql_value)
+        return self.normalize(sql_value)
 
     def to_sql(self, model_value: Any) -> SQLiteType:
         """Convert a value as stored in the model object to a value used
@@ -152,7 +140,7 @@ class Default(Type[str, None]):
     model_type = str
 
     @property
-    def null(self):
+    def null(self) -> None:
         return None
 
 
@@ -160,7 +148,7 @@ class BaseInteger(Type[int, N]):
     """A basic integer type."""
 
     sql = "INTEGER"
-    query = NumericQuery
+    query = query.NumericQuery
     model_type = int
 
     def normalize(self, value: Any) -> int | N:
@@ -189,23 +177,15 @@ class BasePaddedInt(BaseInteger[N]):
     padded with zeroes.
     """
 
-    def __init__(self, digits: int):
+    def __init__(self, digits: int) -> None:
         self.digits = digits
 
     def format(self, value: int | N) -> str:
-        return "{0:0{1}d}".format(value or 0, self.digits)
+        return f"{value or 0:0{self.digits}d}"
 
 
 class PaddedInt(BasePaddedInt[int]):
     pass
-
-
-class NullPaddedInt(BasePaddedInt[None]):
-    """Same as `PaddedInt`, but does not normalize `None` to `0`."""
-
-    @property
-    def null(self) -> None:
-        return None
 
 
 class ScaledInt(Integer):
@@ -213,12 +193,12 @@ class ScaledInt(Integer):
     constant and adds a suffix. Good for units with large magnitudes.
     """
 
-    def __init__(self, unit: int, suffix: str = ""):
+    def __init__(self, unit: int, suffix: str = "") -> None:
         self.unit = unit
         self.suffix = suffix
 
     def format(self, value: int) -> str:
-        return "{}{}".format((value or 0) // self.unit, self.suffix)
+        return f"{(value or 0) // self.unit}{self.suffix}"
 
 
 class Id(NullInteger):
@@ -230,7 +210,7 @@ class Id(NullInteger):
     def null(self) -> None:
         return None
 
-    def __init__(self, primary: bool = True):
+    def __init__(self, primary: bool = True) -> None:
         if primary:
             self.sql = "INTEGER PRIMARY KEY"
 
@@ -241,14 +221,14 @@ class BaseFloat(Type[float, N]):
     """
 
     sql = "REAL"
-    query: FieldQueryType = NumericQuery
+    query: query.FieldQueryType = query.NumericQuery
     model_type = float
 
-    def __init__(self, digits: int = 1):
+    def __init__(self, digits: int = 1) -> None:
         self.digits = digits
 
     def format(self, value: float | N) -> str:
-        return "{0:.{1}f}".format(value or 0, self.digits)
+        return f"{value or 0:.{self.digits}f}"
 
 
 class Float(BaseFloat[float]):
@@ -271,13 +251,12 @@ class BaseString(Type[T, N]):
     """A Unicode string type."""
 
     sql = "TEXT"
-    query = SubstringQuery
+    query = query.SubstringQuery
 
     def normalize(self, value: Any) -> T | N:
         if value is None:
             return self.null
-        else:
-            return self.model_type(value)
+        return self.model_type(value)
 
 
 class String(BaseString[str, Any]):
@@ -286,40 +265,211 @@ class String(BaseString[str, Any]):
     model_type = str
 
 
-class DelimitedString(BaseString[list[str], list[str]]):
-    """A list of Unicode strings, represented in-database by a single string
+class DelimitedString(BaseString[list, list]):  # type: ignore[type-arg]
+    r"""A list of Unicode strings, represented in-database by a single string
     containing delimiter-separated values.
+
+    In template evaluation the list is formatted by joining the values with
+    a fixed '; ' delimiter regardless of the database delimiter. That is because
+    the '\␀' character used for multi-value fields is mishandled on Windows
+    as it contains a backslash character.
     """
 
     model_type = list
+    fmt_delimiter = "; "
 
-    def __init__(self, delimiter: str):
-        self.delimiter = delimiter
+    def __init__(self, db_delimiter: str) -> None:
+        self.db_delimiter = db_delimiter
 
-    def format(self, value: list[str]):
-        return self.delimiter.join(value)
+    def format(self, value: list[str]) -> str:
+        return self.fmt_delimiter.join(value)
 
-    def parse(self, string: str):
+    def parse(self, string: str) -> list[str]:
         if not string:
             return []
-        return string.split(self.delimiter)
 
-    def to_sql(self, model_value: list[str]):
-        return self.delimiter.join(model_value)
+        delimiter = (
+            self.db_delimiter
+            if self.db_delimiter in string
+            else self.fmt_delimiter
+        )
+        return string.split(delimiter)
+
+    def normalize(self, value: Any) -> list[str]:
+        """
+        For multi-valued tags present in externally-tagged media, we may receive
+        delimiter-separated values that have not been split, rather than
+        assuming that Python-originated values are already split into their
+        constituent values. For example, externally-tagged media files may have
+        multi-valued genre tags, which we need to treat as separate list items
+        here.
+        """
+        if value is None:
+            return self.null
+        if isinstance(value, list):
+            result = []
+            for item in value:
+                if isinstance(item, str) and self.fmt_delimiter in item:
+                    result.extend(item.split(self.fmt_delimiter))
+                else:
+                    result.append(item)
+            return result
+        if isinstance(value, str):
+            return self.parse(value)
+        return self.model_type(value)
+
+    def to_sql(self, model_value: list[str]) -> str:
+        return self.db_delimiter.join(model_value)
 
 
 class Boolean(Type):
     """A boolean type."""
 
     sql = "INTEGER"
-    query = BooleanQuery
+    query = query.BooleanQuery
     model_type = bool
 
     def format(self, value: bool) -> str:
         return str(bool(value))
 
     def parse(self, string: str) -> bool:
-        return str2bool(string)
+        return util.str2bool(string)
+
+
+class DateType(Float):
+    # TODO representation should be `datetime` object
+    # TODO distinguish between date and time types
+    query = query.DateQuery
+
+    def format(self, value: float) -> str:
+        return time.strftime(
+            beets.config["time_format"].as_str(), time.localtime(value or 0)
+        )
+
+    def parse(self, string: str) -> float | N:
+        try:
+            # Try a formatted date string.
+            return time.mktime(
+                time.strptime(string, beets.config["time_format"].as_str())
+            )
+        except ValueError:
+            # Fall back to a plain timestamp number.
+            try:
+                return float(string)
+            except ValueError:
+                return self.null
+
+
+class BasePathType(Type[bytes, N]):
+    """A dbcore type for filesystem paths.
+
+    These are represented as `bytes` objects, in keeping with
+    the Unix filesystem abstraction.
+    """
+
+    sql = "BLOB"
+    query = query.PathQuery
+    model_type = bytes
+
+    def parse(self, string: str) -> bytes:
+        return util.normpath(string)
+
+    def normalize(self, value: Any) -> bytes | N:
+        if isinstance(value, Path):
+            value = str(value)
+
+        if isinstance(value, str):
+            # Paths stored internally as encoded bytes.
+            return util.bytestring_path(value)
+
+        if isinstance(value, BLOB_TYPE):
+            # We unwrap buffers to bytes.
+            return bytes(value)
+
+        return value
+
+    def from_sql(self, sql_value: SQLiteType) -> bytes | N:
+        value = self.normalize(sql_value)
+        if isinstance(value, bytes):
+            return pathutils.expand_path_from_db(value)
+        return value
+
+    def to_sql(self, value: pathutils.MaybeBytes) -> BLOB_TYPE | None:
+        value = pathutils.normalize_path_for_db(value)
+        if isinstance(value, bytes):
+            return BLOB_TYPE(value)
+
+        return value
+
+
+class NullPathType(BasePathType[None]):
+    @property
+    def null(self) -> None:
+        return None
+
+    def format(self, value: bytes | None) -> str:
+        return util.displayable_path(value or b"")
+
+
+class PathType(BasePathType[bytes]):
+    @property
+    def null(self) -> bytes:
+        return b""
+
+    def format(self, value: bytes) -> str:
+        return util.displayable_path(value or b"")
+
+
+class MusicalKey(String):
+    """String representing the musical key of a song.
+
+    The standard format is C, Cm, C#, C#m, etc.
+    """
+
+    ENHARMONIC: ClassVar[dict[str, str]] = {
+        r"db": "c#",
+        r"eb": "d#",
+        r"gb": "f#",
+        r"ab": "g#",
+        r"bb": "a#",
+    }
+
+    null = None
+
+    def parse(self, key: str) -> str | None:
+        key = key.lower()
+        for flat, sharp in self.ENHARMONIC.items():
+            key = re.sub(flat, sharp, key)
+        key = re.sub(r"[\W\s]+minor", "m", key)
+        key = re.sub(r"[\W\s]+major", "", key)
+        return key.capitalize()
+
+    def normalize(self, key: Any) -> str | None:
+        if key is None:
+            return None
+        return self.parse(key)
+
+
+class DurationType(Float):
+    """Human-friendly (M:SS) representation of a time interval."""
+
+    query = query.DurationQuery
+
+    def format(self, value: float) -> str:
+        if not beets.config["format_raw_length"].get(bool):
+            return human_seconds_short(value or 0.0)
+        return str(value)
+
+    def parse(self, string: str) -> float | N:
+        try:
+            # Try to format back hh:ss to seconds.
+            return raw_seconds_short(string)
+        except ValueError:
+            # Fall back to a plain float.
+            try:
+                return float(string)
+            except ValueError:
+                return self.null
 
 
 # Shared instances of common types.
@@ -331,7 +481,8 @@ FLOAT = Float()
 NULL_FLOAT = NullFloat()
 STRING = String()
 BOOLEAN = Boolean()
-SEMICOLON_SPACE_DSV = DelimitedString(delimiter="; ")
+DATE = DateType()
+SEMICOLON_SPACE_DSV = DelimitedString("; ")
 
 # Will set the proper null char in mediafile
-MULTI_VALUE_DSV = DelimitedString(delimiter="\\␀")
+MULTI_VALUE_DSV = DelimitedString(MULTI_VALUE_DELIMITER)

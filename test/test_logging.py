@@ -3,22 +3,19 @@
 import logging as log
 import sys
 import threading
-from io import StringIO
+from types import ModuleType
+
+import pytest
 
 import beets.logging as blog
-import beetsplug
 from beets import plugins, ui
-from beets.test import _common, helper
-from beets.test.helper import (
-    AsIsImporterMixin,
-    BeetsTestCase,
-    ImportTestCase,
-    PluginMixin,
-)
+from beets.test.helper import AsIsImporterMixin, ImportHelper, PluginMixin
 
 
-class LoggingTest(BeetsTestCase):
-    def test_logging_management(self):
+class TestStrFormatLogger:
+    """Tests for the custom str-formatting logger."""
+
+    def test_logger_creation(self):
         l1 = log.getLogger("foo123")
         l2 = blog.getLogger("foo123")
         assert l1 == l2
@@ -38,125 +35,199 @@ class LoggingTest(BeetsTestCase):
         l6 = blog.getLogger()
         assert l1 != l6
 
-    def test_str_format_logging(self):
-        logger = blog.getLogger("baz123")
-        stream = StringIO()
-        handler = log.StreamHandler(stream)
+    @pytest.mark.parametrize(
+        "level", [log.DEBUG, log.INFO, log.WARNING, log.ERROR]
+    )
+    @pytest.mark.parametrize(
+        "msg, args, kwargs, expected",
+        [
+            ("foo {} bar {}", ("oof", "baz"), {}, "foo oof bar baz"),
+            (
+                "foo {bar} baz {foo}",
+                (),
+                {"foo": "oof", "bar": "baz"},
+                "foo baz baz oof",
+            ),
+            ("no args", (), {}, "no args"),
+            ("foo {} bar {baz}", ("oof",), {"baz": "baz"}, "foo oof bar baz"),
+        ],
+    )
+    def test_str_format_logging(
+        self, level, msg, args, kwargs, expected, caplog
+    ):
+        logger = blog.getLogger("test_logger")
+        logger.setLevel(level)
 
-        logger.addHandler(handler)
-        logger.propagate = False
+        with caplog.at_level(level, logger="test_logger"):
+            logger.log(level, msg, *args, **kwargs)
 
-        logger.warning("foo {0} {bar}", "oof", bar="baz")
-        handler.flush()
-        assert stream.getvalue(), "foo oof baz"
+        assert caplog.records, "No log records were captured"
+        assert str(caplog.records[0].msg) == expected
 
 
-class LoggingLevelTest(AsIsImporterMixin, PluginMixin, ImportTestCase):
+class TestLogSanitization:
+    """Log messages should have control characters removed from:
+    - String arguments
+    - Keyword argument values
+    - Bytes arguments (which get decoded first)
+    """
+
+    @pytest.mark.parametrize(
+        "msg, args, kwargs, expected",
+        [
+            # Valid UTF-8 bytes are decoded and preserved
+            (
+                "foo {} bar {bar}",
+                (b"oof \xc3\xa9",),
+                {"bar": b"baz \xc3\xa9"},
+                "foo oof é bar baz é",
+            ),
+            # Invalid UTF-8 bytes are decoded with replacement characters
+            (
+                "foo {} bar {bar}",
+                (b"oof \xff",),
+                {"bar": b"baz \xff"},
+                "foo oof � bar baz �",
+            ),
+            # Control characters should be removed
+            (
+                "foo {} bar {bar}",
+                ("oof \x9e",),
+                {"bar": "baz \x9e"},
+                "foo oof � bar baz �",
+            ),
+            # Whitespace control characters should be preserved
+            (
+                "foo {} bar {bar}",
+                ("foo\t\n",),
+                {"bar": "bar\r"},
+                "foo foo\t\n bar bar\r",
+            ),
+        ],
+    )
+    def test_sanitization(self, msg, args, kwargs, expected, caplog):
+        level = log.INFO
+        logger = blog.getLogger("test_logger")
+        logger.setLevel(level)
+
+        with caplog.at_level(level, logger="test_logger"):
+            logger.log(level, msg, *args, **kwargs)
+
+        assert caplog.records, "No log records were captured"
+        assert str(caplog.records[0].msg) == expected
+
+
+class DummyModule(ModuleType):
+    class DummyPlugin(plugins.BeetsPlugin):
+        def __init__(self):
+            plugins.BeetsPlugin.__init__(self, "dummy")
+            self.import_stages = [self.import_stage]
+            self.register_listener("dummy_event", self.listener)
+
+        def log_all(self, name):
+            self._log.debug("debug {}", name)
+            self._log.info("info {}", name)
+            self._log.warning("warning {}", name)
+
+        def commands(self):
+            cmd = ui.Subcommand("dummy")
+            cmd.func = lambda _, __, ___: self.log_all("cmd")
+            return (cmd,)
+
+        def import_stage(self, session, task):
+            self.log_all("import_stage")
+
+        def listener(self):
+            self.log_all("listener")
+
+    def __init__(self, *_, **__):
+        module_name = "beetsplug.dummy"
+        super().__init__(module_name)
+        self.DummyPlugin.__module__ = module_name
+        self.DummyPlugin = self.DummyPlugin
+
+
+class TestLoggingLevel(AsIsImporterMixin, PluginMixin, ImportHelper):
     plugin = "dummy"
 
-    class DummyModule:
-        class DummyPlugin(plugins.BeetsPlugin):
-            def __init__(self):
-                plugins.BeetsPlugin.__init__(self, "dummy")
-                self.import_stages = [self.import_stage]
-                self.register_listener("dummy_event", self.listener)
+    @pytest.fixture(autouse=True)
+    def _patch_dummy_module(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "beetsplug.dummy", DummyModule())
 
-            def log_all(self, name):
-                self._log.debug("debug " + name)
-                self._log.info("info " + name)
-                self._log.warning("warning " + name)
-
-            def commands(self):
-                cmd = ui.Subcommand("dummy")
-                cmd.func = lambda _, __, ___: self.log_all("cmd")
-                return (cmd,)
-
-            def import_stage(self, session, task):
-                self.log_all("import_stage")
-
-            def listener(self):
-                self.log_all("listener")
-
-    def setUp(self):
-        sys.modules["beetsplug.dummy"] = self.DummyModule
-        beetsplug.dummy = self.DummyModule
-        super().setUp()
-
-    def test_command_level0(self):
+    def test_command_level0(self, caplog):
         self.config["verbose"] = 0
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_command("dummy")
-        assert "dummy: warning cmd" in logs
-        assert "dummy: info cmd" in logs
-        assert "dummy: debug cmd" not in logs
+        assert "warning cmd" in caplog.messages
+        assert "info cmd" in caplog.messages
+        assert "debug cmd" not in caplog.messages
 
-    def test_command_level1(self):
+    def test_command_level1(self, caplog):
         self.config["verbose"] = 1
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_command("dummy")
-        assert "dummy: warning cmd" in logs
-        assert "dummy: info cmd" in logs
-        assert "dummy: debug cmd" in logs
+        assert "warning cmd" in caplog.messages
+        assert "info cmd" in caplog.messages
+        assert "debug cmd" in caplog.messages
 
-    def test_command_level2(self):
+    def test_command_level2(self, caplog):
         self.config["verbose"] = 2
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_command("dummy")
-        assert "dummy: warning cmd" in logs
-        assert "dummy: info cmd" in logs
-        assert "dummy: debug cmd" in logs
+        assert "warning cmd" in caplog.messages
+        assert "info cmd" in caplog.messages
+        assert "debug cmd" in caplog.messages
 
-    def test_listener_level0(self):
+    def test_listener_level0(self, caplog):
         self.config["verbose"] = 0
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             plugins.send("dummy_event")
-        assert "dummy: warning listener" in logs
-        assert "dummy: info listener" not in logs
-        assert "dummy: debug listener" not in logs
+        assert "warning listener" in caplog.messages
+        assert "info listener" not in caplog.messages
+        assert "debug listener" not in caplog.messages
 
-    def test_listener_level1(self):
+    def test_listener_level1(self, caplog):
         self.config["verbose"] = 1
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             plugins.send("dummy_event")
-        assert "dummy: warning listener" in logs
-        assert "dummy: info listener" in logs
-        assert "dummy: debug listener" not in logs
+        assert "warning listener" in caplog.messages
+        assert "info listener" in caplog.messages
+        assert "debug listener" not in caplog.messages
 
-    def test_listener_level2(self):
+    def test_listener_level2(self, caplog):
         self.config["verbose"] = 2
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             plugins.send("dummy_event")
-        assert "dummy: warning listener" in logs
-        assert "dummy: info listener" in logs
-        assert "dummy: debug listener" in logs
+        assert "warning listener" in caplog.messages
+        assert "info listener" in caplog.messages
+        assert "debug listener" in caplog.messages
 
-    def test_import_stage_level0(self):
+    def test_import_stage_level0(self, caplog):
         self.config["verbose"] = 0
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_asis_importer()
-        assert "dummy: warning import_stage" in logs
-        assert "dummy: info import_stage" not in logs
-        assert "dummy: debug import_stage" not in logs
+        assert "warning import_stage" in caplog.messages
+        assert "info import_stage" not in caplog.messages
+        assert "debug import_stage" not in caplog.messages
 
-    def test_import_stage_level1(self):
+    def test_import_stage_level1(self, caplog):
         self.config["verbose"] = 1
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_asis_importer()
-        assert "dummy: warning import_stage" in logs
-        assert "dummy: info import_stage" in logs
-        assert "dummy: debug import_stage" not in logs
+        assert "warning import_stage" in caplog.messages
+        assert "info import_stage" in caplog.messages
+        assert "debug import_stage" not in caplog.messages
 
-    def test_import_stage_level2(self):
+    def test_import_stage_level2(self, caplog):
         self.config["verbose"] = 2
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_asis_importer()
-        assert "dummy: warning import_stage" in logs
-        assert "dummy: info import_stage" in logs
-        assert "dummy: debug import_stage" in logs
+        assert "warning import_stage" in caplog.messages
+        assert "info import_stage" in caplog.messages
+        assert "debug import_stage" in caplog.messages
 
 
-@_common.slow_test()
-class ConcurrentEventsTest(AsIsImporterMixin, ImportTestCase):
+class TestConcurrentEvents(AsIsImporterMixin, ImportHelper):
     """Similar to LoggingLevelTest but lower-level and focused on multiple
     events interaction. Since this is a bit heavy we don't do it in
     LoggingLevelTest.
@@ -174,11 +245,6 @@ class ConcurrentEventsTest(AsIsImporterMixin, ImportTestCase):
             self.test_case = test_case
             self.exc = None
             self.t1_step = self.t2_step = 0
-
-        def log_all(self, name):
-            self._log.debug("debug " + name)
-            self._log.info("info " + name)
-            self._log.warning("warning " + name)
 
         def listener1(self):
             try:
@@ -253,23 +319,48 @@ class ConcurrentEventsTest(AsIsImporterMixin, ImportTestCase):
             print("Alive threads:", threading.enumerate())
             raise
 
-    def test_root_logger_levels(self):
+    def test_root_logger_levels(self, caplog):
         """Root logger level should be shared between threads."""
         self.config["threaded"] = True
 
         blog.getLogger("beets").set_global_level(blog.WARNING)
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_asis_importer()
-        assert logs == []
+        assert caplog.messages == []
 
         blog.getLogger("beets").set_global_level(blog.INFO)
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_asis_importer()
-        for line in logs:
+        for line in caplog.messages:
             assert "import" in line
             assert "album" in line
 
         blog.getLogger("beets").set_global_level(blog.DEBUG)
-        with helper.capture_log() as logs:
+        with caplog.at_level("DEBUG"):
             self.run_asis_importer()
-        assert "Sending event: database_change" in logs
+        assert "Sending event: database_change" in caplog.messages
+
+
+class TestLegacyFormatter:
+    """Tests for ``LegacyFormatter``, which strips the ``beets.`` prefix
+    from logger names and prepends the remainder to the message.
+    """
+
+    @pytest.mark.parametrize(
+        "logger_name, expected",
+        [
+            ("beets", "hello world"),
+            ("beets.musicbrainz", "musicbrainz: hello world"),
+            ("beets.musicbrainz.sub", "musicbrainz.sub: hello world"),
+            ("root.foobar", "foobar: hello world"),
+        ],
+    )
+    def test_format(self, logger_name, expected):
+        """Root logger passes message unchanged; child loggers get
+        ``prefix: msg`` format after the ``beets.`` prefix is stripped.
+        """
+        formatter = blog.LegacyFormatter("%(legacy_prefix)s%(message)s")
+        record = log.LogRecord(
+            logger_name, log.INFO, __file__, 0, "hello world", (), None
+        )
+        assert formatter.format(record) == expected

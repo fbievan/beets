@@ -4,26 +4,34 @@ modification time (mtime) of the item's source file before import.
 Reimported albums and items are skipped.
 """
 
+from __future__ import annotations
+
 import os
+from typing import TYPE_CHECKING
 
 from beets import importer, util
 from beets.plugins import BeetsPlugin
 
+if TYPE_CHECKING:
+    from beets.importer import ImportSession, ImportTask
+    from beets.library import Album, Item, Library
+
 
 class ImportAddedPlugin(BeetsPlugin):
-    def __init__(self):
+    item_mtime: dict[bytes, float]
+    reimported_item_ids: set[int | None]
+    replaced_album_paths: set[bytes]
+
+    def __init__(self) -> None:
         super().__init__()
         self.config.add(
-            {
-                "preserve_mtimes": False,
-                "preserve_write_mtimes": False,
-            }
+            {"preserve_mtimes": False, "preserve_write_mtimes": False}
         )
 
         # item.id for new items that were reimported
-        self.reimported_item_ids = None
+        self.reimported_item_ids = set()
         # album.path for old albums that were replaced by a reimported album
-        self.replaced_album_paths = None
+        self.replaced_album_paths = set()
         # item path in the library to the mtime of the source file
         self.item_mtime = {}
 
@@ -40,16 +48,21 @@ class ImportAddedPlugin(BeetsPlugin):
         register("item_imported", self.update_item_times)
         register("after_write", self.update_after_write_time)
 
-    def check_config(self, task, session):
+    def check_config(
+        self, task: ImportTask, session: ImportSession
+    ) -> list[ImportTask] | None:
         self.config["preserve_mtimes"].get(bool)
+        return None
 
-    def reimported_item(self, item):
+    def reimported_item(self, item: Item) -> bool:
         return item.id in self.reimported_item_ids
 
-    def reimported_album(self, album):
+    def reimported_album(self, album: Album) -> bool:
         return album.path in self.replaced_album_paths
 
-    def record_if_inplace(self, task, session):
+    def record_if_inplace(
+        self, task: ImportTask, session: ImportSession
+    ) -> list[ImportTask] | None:
         if not (
             session.config["copy"]
             or session.config["move"]
@@ -58,8 +71,7 @@ class ImportAddedPlugin(BeetsPlugin):
             or session.config["reflink"]
         ):
             self._log.debug(
-                "In place import detected, recording mtimes from "
-                "source paths"
+                "In place import detected, recording mtimes from source paths"
             )
             items = (
                 [task.item]
@@ -69,7 +81,11 @@ class ImportAddedPlugin(BeetsPlugin):
             for item in items:
                 self.record_import_mtime(item, item.path, item.path)
 
-    def record_reimported(self, task, session):
+        return None
+
+    def record_reimported(
+        self, task: ImportTask, session: ImportSession
+    ) -> None:
         self.reimported_item_ids = {
             item.id
             for item, replaced_items in task.replaced_items.items()
@@ -77,36 +93,38 @@ class ImportAddedPlugin(BeetsPlugin):
         }
         self.replaced_album_paths = set(task.replaced_albums.keys())
 
-    def write_file_mtime(self, path, mtime):
+    def write_file_mtime(self, path: str, mtime: float) -> None:
         """Write the given mtime to the destination path."""
         stat = os.stat(util.syspath(path))
         os.utime(util.syspath(path), (stat.st_atime, mtime))
 
-    def write_item_mtime(self, item, mtime):
+    def write_item_mtime(self, item: Item, mtime: float) -> None:
         """Write the given mtime to an item's `mtime` field and to the mtime
         of the item's file.
         """
         # The file's mtime on disk must be in sync with the item's mtime
         self.write_file_mtime(util.syspath(item.path), mtime)
-        item.mtime = mtime
+        item.mtime = int(mtime)
 
-    def record_import_mtime(self, item, source, destination):
+    def record_import_mtime(
+        self, item: Item, source: bytes, destination: bytes
+    ) -> None:
         """Record the file mtime of an item's path before its import."""
         mtime = os.stat(util.syspath(source)).st_mtime
         self.item_mtime[destination] = mtime
         self._log.debug(
-            "Recorded mtime {0} for item '{1}' imported from " "'{2}'",
+            "Recorded mtime {} for item '{}' imported from '{}'",
             mtime,
             util.displayable_path(destination),
             util.displayable_path(source),
         )
 
-    def update_album_times(self, lib, album):
+    def update_album_times(self, lib: Library, album: Album) -> None:
         if self.reimported_album(album):
             self._log.debug(
-                "Album '{0}' is reimported, skipping import of "
+                "Album '{.filepath}' is reimported, skipping import of "
                 "added dates for the album and its items.",
-                util.displayable_path(album.path),
+                album,
             )
             return
 
@@ -120,18 +138,17 @@ class ImportAddedPlugin(BeetsPlugin):
                     item.store()
         album.added = min(album_mtimes)
         self._log.debug(
-            "Import of album '{0}', selected album.added={1} "
+            "Import of album '{0.album}', selected album.added={0.added} "
             "from item file mtimes.",
-            album.album,
-            album.added,
+            album,
         )
         album.store()
 
-    def update_item_times(self, lib, item):
+    def update_item_times(self, lib: Library, item: Item) -> None:
         if self.reimported_item(item):
             self._log.debug(
-                "Item '{0}' is reimported, skipping import of " "added date.",
-                util.displayable_path(item.path),
+                "Item '{.filepath}' is reimported, skipping import of added date.",
+                item,
             )
             return
         mtime = self.item_mtime.pop(item.path, None)
@@ -140,13 +157,12 @@ class ImportAddedPlugin(BeetsPlugin):
             if self.config["preserve_mtimes"].get(bool):
                 self.write_item_mtime(item, mtime)
             self._log.debug(
-                "Import of item '{0}', selected item.added={1}",
-                util.displayable_path(item.path),
-                item.added,
+                "Import of item '{0.filepath}', selected item.added={0.added}",
+                item,
             )
             item.store()
 
-    def update_after_write_time(self, item, path):
+    def update_after_write_time(self, item: Item, path: bytes) -> None:
         """Update the mtime of the item's file with the item.added value
         after each write of the item if `preserve_write_mtimes` is enabled.
         """
@@ -154,7 +170,6 @@ class ImportAddedPlugin(BeetsPlugin):
             if self.config["preserve_write_mtimes"].get(bool):
                 self.write_item_mtime(item, item.added)
             self._log.debug(
-                "Write of item '{0}', selected item.added={1}",
-                util.displayable_path(item.path),
-                item.added,
+                "Write of item '{0.filepath}', selected item.added={0.added}",
+                item,
             )

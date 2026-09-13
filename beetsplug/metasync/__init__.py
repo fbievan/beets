@@ -1,55 +1,54 @@
-# This file is part of beets.
-# Copyright 2016, Heinz Wiesinger.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """Synchronize information from music player libraries"""
+
+from __future__ import annotations
 
 from abc import ABCMeta, abstractmethod
 from importlib import import_module
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 from confuse import ConfigValueError
 
 from beets import ui
 from beets.plugins import BeetsPlugin
 
+if TYPE_CHECKING:
+    from confuse import ConfigView
+
+    from beets.dbcore import types
+    from beets.library import Item, Library
+    from beets.logging import BeetsLogger as Logger
+
 METASYNC_MODULE = "beetsplug.metasync"
 
 # Dictionary to map the MODULE and the CLASS NAME of meta sources
-SOURCES = {
-    "amarok": "Amarok",
-    "itunes": "Itunes",
-}
+SOURCES = {"amarok": "Amarok", "itunes": "Itunes"}
+
+
+class MetaSyncCLIOpts(Protocol):
+    pretend: bool | None
+    sources: list[str]
 
 
 class MetaSource(metaclass=ABCMeta):
-    def __init__(self, config, log):
-        self.item_types = {}
+    item_types: ClassVar[dict[str, types.Type]]
+
+    def __init__(self, config: ConfigView, log: Logger) -> None:
         self.config = config
         self._log = log
 
     @abstractmethod
-    def sync_from_source(self, item):
+    def sync_from_source(self, item: Item) -> None:
         pass
 
 
-def load_meta_sources():
+def load_meta_sources() -> dict[str, type[MetaSource]]:
     """Returns a dictionary of all the MetaSources
     E.g., {'itunes': Itunes} with isinstance(Itunes, MetaSource) true
     """
     meta_sources = {}
 
     for module_path, class_name in SOURCES.items():
-        module = import_module(METASYNC_MODULE + "." + module_path)
+        module = import_module(f"{METASYNC_MODULE}.{module_path}")
         meta_sources[class_name.lower()] = getattr(module, class_name)
 
     return meta_sources
@@ -58,7 +57,7 @@ def load_meta_sources():
 META_SOURCES = load_meta_sources()
 
 
-def load_item_types():
+def load_item_types() -> dict[str, types.Type]:
     """Returns a dictionary containing the item_types of all the MetaSources"""
     item_types = {}
     for meta_source in META_SOURCES.values():
@@ -69,10 +68,10 @@ def load_item_types():
 class MetaSyncPlugin(BeetsPlugin):
     item_types = load_item_types()
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
 
-    def commands(self):
+    def commands(self) -> list[ui.Subcommand]:
         cmd = ui.Subcommand(
             "metasync", help="update metadata from music player libraries"
         )
@@ -94,10 +93,11 @@ class MetaSyncPlugin(BeetsPlugin):
         cmd.func = self.func
         return [cmd]
 
-    def func(self, lib, opts, args):
+    def func(
+        self, lib: Library, opts: MetaSyncCLIOpts, args: list[str]
+    ) -> None:
         """Command handler for the metasync function."""
         pretend = opts.pretend
-        query = ui.decargs(args)
 
         sources = []
         for source in opts.sources:
@@ -106,7 +106,7 @@ class MetaSyncPlugin(BeetsPlugin):
         sources = sources or self.config["source"].as_str_seq()
 
         meta_source_instances = {}
-        items = lib.items(query)
+        items = lib.items(args)
 
         # Avoid needlessly instantiating meta sources (can be expensive)
         if not items:
@@ -118,13 +118,13 @@ class MetaSyncPlugin(BeetsPlugin):
             try:
                 cls = META_SOURCES[player]
             except KeyError:
-                self._log.error("Unknown metadata source '{}'".format(player))
+                self._log.error("Unknown metadata source '{}'", player)
 
             try:
                 meta_source_instances[player] = cls(self.config, self._log)
             except (ImportError, ConfigValueError) as e:
                 self._log.error(
-                    f"Failed to instantiate metadata source {player!r}: {e}"
+                    "Failed to instantiate metadata source {!r}: {}", player, e
                 )
 
         # Avoid needlessly iterating over items

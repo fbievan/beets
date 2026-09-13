@@ -1,18 +1,6 @@
-# This file is part of beets.
-# Copyright 2016, Tom Jaspers.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """Synchronize information from iTunes's library"""
+
+from __future__ import annotations
 
 import os
 import plistlib
@@ -20,19 +8,27 @@ import shutil
 import tempfile
 from contextlib import contextmanager
 from time import mktime
+from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import unquote, urlparse
 
 from confuse import ConfigValueError
 
 from beets import util
 from beets.dbcore import types
-from beets.library import DateType
 from beets.util import bytestring_path, syspath
 from beetsplug.metasync import MetaSource
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from confuse import ConfigView
+
+    from beets.library import Item
+    from beets.logging import BeetsLogger as Logger
+
 
 @contextmanager
-def create_temporary_copy(path):
+def create_temporary_copy(path: util.PathLike) -> Iterator[bytes]:
     temp_dir = bytestring_path(tempfile.mkdtemp())
     temp_path = os.path.join(temp_dir, b"temp_itunes_lib")
     shutil.copyfile(syspath(path), syspath(temp_path))
@@ -42,7 +38,7 @@ def create_temporary_copy(path):
         shutil.rmtree(syspath(temp_dir))
 
 
-def _norm_itunes_path(path):
+def _norm_itunes_path(path: bytes) -> bytes:
     # Itunes prepends the location with 'file://' on posix systems,
     # and with 'file://localhost/' on Windows systems.
     # The actual path to the file is always saved as posix form
@@ -59,16 +55,16 @@ def _norm_itunes_path(path):
 
 
 class Itunes(MetaSource):
-    item_types = {
+    item_types: ClassVar[dict[str, types.Type]] = {
         "itunes_rating": types.INTEGER,  # 0..100 scale
         "itunes_playcount": types.INTEGER,
         "itunes_skipcount": types.INTEGER,
-        "itunes_lastplayed": DateType(),
-        "itunes_lastskipped": DateType(),
-        "itunes_dateadded": DateType(),
+        "itunes_lastplayed": types.DATE,
+        "itunes_lastskipped": types.DATE,
+        "itunes_dateadded": types.DATE,
     }
 
-    def __init__(self, config, log):
+    def __init__(self, config: ConfigView, log: Logger) -> None:
         super().__init__(config, log)
 
         config.add({"itunes": {"library": "~/Music/iTunes/iTunes Library.xml"}})
@@ -77,12 +73,12 @@ class Itunes(MetaSource):
         library_path = config["itunes"]["library"].as_filename()
 
         try:
-            self._log.debug(f"loading iTunes library from {library_path}")
+            self._log.debug("loading iTunes library from {}", library_path)
             with create_temporary_copy(library_path) as library_copy:
                 with open(library_copy, "rb") as library_copy_f:
                     raw_library = plistlib.load(library_copy_f)
         except OSError as e:
-            raise ConfigValueError("invalid iTunes library: " + e.strerror)
+            raise ConfigValueError(f"invalid iTunes library: {e.strerror}")
         except Exception:
             # It's likely the user configured their '.itl' library (<> xml)
             if os.path.splitext(library_path)[1].lower() != ".xml":
@@ -92,7 +88,7 @@ class Itunes(MetaSource):
                 )
             else:
                 hint = ""
-            raise ConfigValueError("invalid iTunes library" + hint)
+            raise ConfigValueError(f"invalid iTunes library{hint}")
 
         # Make the iTunes library queryable using the path
         self.collection = {
@@ -101,11 +97,11 @@ class Itunes(MetaSource):
             if "Location" in track
         }
 
-    def sync_from_source(self, item):
+    def sync_from_source(self, item: Item) -> None:
         result = self.collection.get(util.bytestring_path(item.path).lower())
 
         if not result:
-            self._log.warning(f"no iTunes match found for {item}")
+            self._log.warning("no iTunes match found for {}", item)
             return
 
         item.itunes_rating = result.get("Rating")

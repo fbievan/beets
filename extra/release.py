@@ -6,18 +6,20 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from functools import partial
 from io import StringIO
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import NamedTuple, TypeAlias
 
 import click
 import tomli
 from packaging.version import Version, parse
 from sphinx.ext import intersphinx
-from typing_extensions import TypeAlias
+
+from docs.conf import rst_epilog
 
 BASE = Path(__file__).parent.parent.absolute()
 PYPROJECT = BASE / "pyproject.toml"
@@ -46,11 +48,13 @@ class Ref(NamedTuple):
         Each line has the following structure:
         <id>    [optional title : ] <relative-url-path>
 
+        See the output of
+            python -m sphinx.ext.intersphinx docs/_build/html/objects.inv
         """
         if len(line_parts := line.split(" ", 1)) == 1:
             return cls(line, None, None)
 
-        id, path_with_name = line_parts
+        id_, path_with_name = line_parts
         parts = [p.strip() for p in path_with_name.split(":", 1)]
 
         if len(parts) == 1:
@@ -58,7 +62,7 @@ class Ref(NamedTuple):
         else:
             name, path = parts
 
-        return cls(id, path, name)
+        return cls(id_, path, name)
 
     @property
     def url(self) -> str:
@@ -82,10 +86,11 @@ def get_refs() -> dict[str, Ref]:
     with redirect_stdout(captured_output):
         intersphinx.inspect_main([str(objects_filepath)])
 
+    lines = captured_output.getvalue().replace("\t", "    ").splitlines()
     return {
         r.id: r
-        for ln in captured_output.getvalue().split("\n")
-        if ln.startswith("\t") and (r := Ref.from_line(ln.strip()))
+        for ln in lines
+        if ln.startswith("    ") and (r := Ref.from_line(ln.strip()))
     }
 
 
@@ -94,26 +99,36 @@ def create_rst_replacements() -> list[Replacement]:
     refs = get_refs()
 
     def make_ref_link(ref_id: str, name: str | None = None) -> str:
-        ref = refs[ref_id]
-        return rf"`{name or ref.name} <{ref.url}>`_"
+        if ref_id.endswith("-cmd"):
+            name = f"{ref_id.removesuffix('-cmd')} command"
+        try:
+            ref = refs[ref_id]
+        except KeyError:
+            return f"``{name or ref_id}``"
+        else:
+            return rf"`{name or ref.name} <{ref.url}>`_"
 
     commands = "|".join(r.split("-")[0] for r in refs if r.endswith("-cmd"))
     plugins = "|".join(
         r.split("/")[-1] for r in refs if r.startswith("plugins/")
     )
+    explicit_replacements = dict(
+        line.removeprefix(".. ").split(" replace:: ")
+        for line in filter(None, rst_epilog.splitlines())
+    )
     return [
-        # Fix nested bullet points indent: use 2 spaces consistently
-        (r"(?<=\n) {3,4}(?=\*)", "  "),
-        # Fix nested text indent: use 4 spaces consistently
-        (r"(?<=\n) {5,6}(?=[\w:`])", "    "),
-        # Replace Sphinx :ref: and :doc: directives by documentation URLs
-        #   :ref:`/plugins/autobpm` -> [AutoBPM Plugin](DOCS/plugins/autobpm.html)
+        # Replace explicitly defined substitutions from rst_epilog
+        #    |BeetsPlugin| -> :class:`beets.plugins.BeetsPlugin`
+        (r"\|\w[^ ]*\|", lambda m: explicit_replacements.get(m[0], m[0])),
+        # Replace Sphinx directives by documentation URLs, e.g.,
+        #   :ref:`/plugins/autobpm` -> [AutoBPM Plugin](DOCS/plugins/autobpm.html)  # noqa: E501
+        #   :ref:`list-cmd` -> [list command](DOCS/reference/cli.html#list-cmd)
         (
-            r":(?:ref|doc):`+(?:([^`<]+)<)?/?([\w./_-]+)>?`+",
+            r":(?:ref|doc|class|conf):`+~?(?:([^`<]+)<)?/?([\w.:/_-]+)>?`+",
             lambda m: make_ref_link(m[2], m[1]),
         ),
         # Convert command references to documentation URLs
-        #   `beet move` or `move` command -> [import](DOCS/reference/cli.html#import)
+        #   `beet move` or `move` command -> [move command](DOCS/reference/cli.html#move-cmd)  # noqa: E501
         (
             rf"`+beet ({commands})`+|`+({commands})`+(?= command)",
             lambda m: make_ref_link(f"{m[1] or m[2]}-cmd"),
@@ -121,9 +136,6 @@ def create_rst_replacements() -> list[Replacement]:
         # Convert plugin references to documentation URLs
         #   `fetchart` plugin -> [fetchart](DOCS/plugins/fetchart.html)
         (rf"`+({plugins})`+", lambda m: make_ref_link(f"plugins/{m[1]}")),
-        # Add additional backticks around existing backticked text to ensure it
-        # is rendered as inline code in Markdown
-        (r"(?<=[\s])(`[^`]+`)(?!_)", r"`\1`"),
         # Convert bug references to GitHub issue links
         (r":bug:`(\d+)`", r":bug: (#\1)"),
         # Convert user references to GitHub @mentions
@@ -131,16 +143,9 @@ def create_rst_replacements() -> list[Replacement]:
     ]
 
 
-MD_REPLACEMENTS: list[Replacement] = [
-    (r"^  (- )", r"\1"),  # remove indent from top-level bullet points
-    (r"^ +(  - )", r"\1"),  # adjust nested bullet points indent
-    (r"^(\w[^\n]{,80}):(?=\n\n[^ ])", r"### \1"),  # format section headers
-    (r"^(\w[^\n]{81,}):(?=\n\n[^ ])", r"**\1**"),  # and bolden too long ones
-    (r"### [^\n]+\n+(?=### )", ""),  # remove empty sections
-]
 order_bullet_points = partial(
-    re.compile("(\n- .*?(?=\n(?! *- )|$))", flags=re.DOTALL).sub,
-    lambda m: "\n- ".join(sorted(m.group().split("\n- "))),
+    re.compile(r"(\n- .*?(?=\n(?! *(-|\d\.) )|$))", flags=re.DOTALL).sub,
+    lambda m: "\n- ".join(sorted(m.group().split("\n- "), key=str.lower)),
 )
 
 
@@ -159,16 +164,24 @@ def update_changelog(text: str, new: Version) -> str:
 Unreleased
 ----------
 
-New features:
+..
+    New features
+    ~~~~~~~~~~~~
 
-Bug fixes:
+..
+    Bug fixes
+    ~~~~~~~~~
 
-For packagers:
+..
+    For plugin developers
+    ~~~~~~~~~~~~~~~~~~~~~
 
-Other changes:
+..
+    Other changes
+    ~~~~~~~~~~~~~
 
 {new_header}
-{'-' * len(new_header)}
+{"-" * len(new_header)}
 """,
         text,
     )
@@ -196,7 +209,7 @@ def validate_new_version(
 ) -> Version:
     """Validate the version is newer than the current one."""
     with PYPROJECT.open("rb") as f:
-        current = parse(tomli.load(f)["tool"]["poetry"]["version"])
+        current = parse(tomli.load(f)["project"]["version"])
 
     if not value > current:
         msg = f"version must be newer than {current}"
@@ -241,16 +254,13 @@ def changelog_as_markdown(rst: str) -> str:
 
     md = rst2md(rst)
 
-    for pattern, repl in MD_REPLACEMENTS:
-        md = re.sub(pattern, repl, md, flags=re.M | re.DOTALL)
-
     # order bullet points in each of the lists alphabetically to
     # improve readability
     return order_bullet_points(md)
 
 
 @click.group()
-def cli():
+def cli() -> None:
     pass
 
 
@@ -262,7 +272,7 @@ def bump(version: Version) -> None:
 
 
 @cli.command()
-def changelog():
+def changelog() -> None:
     """Get the most recent version's changelog as Markdown."""
     if changelog := get_changelog_contents():
         try:

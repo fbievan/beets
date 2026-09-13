@@ -1,28 +1,13 @@
-# This file is part of beets.
-# Copyright 2016, Thomas Scholtes.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
-
 import time
 from datetime import datetime
 
 import pytest
 from confuse import ConfigValueError
 
-from beets.test.helper import PluginTestCase
+from beets.test.helper import IOMixin, PluginTestCase
 
 
-class TypesPluginTest(PluginTestCase):
+class TypesPluginTest(IOMixin, PluginTestCase):
     plugin = "types"
 
     def test_integer_modify_and_query(self):
@@ -134,7 +119,7 @@ class TypesPluginTest(PluginTestCase):
     def test_unknown_type_error(self):
         self.config["types"] = {"flex": "unkown type"}
         with pytest.raises(ConfigValueError):
-            self.run_command("ls")
+            self.add_item(flex="test")
 
     def test_template_if_def(self):
         # Tests for a subtle bug when using %ifdef in templates along with

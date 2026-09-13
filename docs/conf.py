@@ -1,18 +1,57 @@
-AUTHOR = "Adrian Sampson"
+# Configuration file for the Sphinx documentation builder.
+#
+# For the full list of built-in configuration values, see the documentation:
+# https://www.sphinx-doc.org/en/master/usage/configuration.html
 
-# General configuration
+# -- Project information -----------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-extensions = ["sphinx.ext.autodoc", "sphinx.ext.extlinks"]
+import sys
+from pathlib import Path
 
-exclude_patterns = ["_build"]
-source_suffix = ".rst"
-master_doc = "index"
+# Add custom extensions directory to path
+sys.path.insert(0, str(Path(__file__).parent / "extensions"))
 
 project = "beets"
-copyright = "2016, Adrian Sampson"
+AUTHOR = "Adrian Sampson"
+copyright = "2016, Adrian Sampson"  # noqa: A001
 
-version = "2.2"
-release = "2.2.0"
+master_doc = "index"
+language = "en"
+version = "2.14"
+release = "2.14.0"
+
+# -- General configuration ---------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
+
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.extlinks",
+    "sphinx.ext.viewcode",
+    "sphinx_design",
+    "sphinx_copybutton",
+    "conf",
+    "sphinx_toolbox.more_autodoc.autotypeddict",
+    "sphinx_toolbox.more_autodoc.autonamedtuple",
+]
+
+autosummary_generate = True
+autosummary_context = {
+    "related_typeddicts": {
+        "MusicBrainzAPI": [
+            "beetsplug._utils.musicbrainz.LookupKwargs",
+            "beetsplug._utils.musicbrainz.SearchKwargs",
+            "beetsplug._utils.musicbrainz.BrowseKwargs",
+            "beetsplug._utils.musicbrainz.BrowseRecordingsKwargs",
+            "beetsplug._utils.musicbrainz.BrowseReleaseGroupsKwargs",
+        ]
+    }
+}
+autodoc_member_order = "bysource"
+exclude_patterns = ["_build"]
+templates_path = ["_templates"]
+source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 
 pygments_style = "sphinx"
 
@@ -31,6 +70,25 @@ linkcheck_ignore = [
     r"https?://127\.0\.0\.1",
     r"https://www.musixmatch.com/",  # blocks requests
     r"https://genius.com/",  # blocks requests
+    r"https://sourceforge\.net/",  # blocks requests
+    r"https://[^/]*fanart\.tv/",  # blocks requests
+    r"https://[^/]*fandom\.com/",  # blocks requests
+    r"https://imgur\.com/",  # not accessible from the UK
+    r"https://(www\.)?discogs.com.*",  # blocks requests
+    r"https://essentia.upf.edu/",  # times out in CI
+    r"https://flask.palletsprojects.com.*",  # times out in CI
+    r"https://search.worldcat.org.*",  # blocks requests
+    r"https://tidal.com.*",  # blocks requests
+    r"https://www.tekstowo.pl/",  # blocks requests
+    r"https://www.gnu.org.*",  # sometimes unreachable
+    r"https://www.nongnu.org.*",  # sometimes unreachable
+    r"https://web.archive.org.*",  # sometimes unreachable
+    r"https://www.sonos.com.*",  # blocks requests
+    r"https://stackoverflow.com.*",  # blocks requests
+    r"https://superuser.com.*",  # blocks requests
+    r"https://support.discogs.com.*",  # blocks requests
+    r"https://forge\.kanis\.fr.*",  # SSL cert issues
+    r"https://id3\.org.*",  # intermittent server errors
 ]
 
 # Options for HTML output
@@ -38,7 +96,7 @@ htmlhelp_basename = "beetsdoc"
 
 # Options for LaTeX output
 latex_documents = [
-    ("index", "beets.tex", "beets Documentation", AUTHOR, "manual"),
+    ("index", "beets.tex", "beets Documentation", AUTHOR, "manual")
 ]
 
 # Options for manual page output
@@ -59,16 +117,42 @@ man_pages = [
     ),
 ]
 
-# Options for pydata theme
+# Global substitutions that can be used anywhere in the documentation.
+rst_epilog = r"""
+.. |Album| replace:: :class:`~beets.library.models.Album`
+.. |AlbumInfo| replace:: :class:`beets.autotag.hooks.AlbumInfo`
+.. |BeetsPlugin| replace:: :class:`beets.plugins.BeetsPlugin`
+.. |ImportSession| replace:: :class:`~beets.importer.session.ImportSession`
+.. |ImportTask| replace:: :class:`~beets.importer.tasks.ImportTask`
+.. |Item| replace:: :class:`~beets.library.models.Item`
+.. |Library| replace:: :class:`~beets.library.library.Library`
+.. |Model| replace:: :class:`~beets.dbcore.db.Model`
+.. |TrackInfo| replace:: :class:`beets.autotag.hooks.TrackInfo`
+.. |semicolon_space| replace:: :literal:`; \ `
+"""
+
+# -- Options for HTML output -------------------------------------------------
+# https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
+
+
 html_theme = "pydata_sphinx_theme"
 html_theme_options = {
-    "collapse_navigation": True,
-    "logo": {
-        "text": "beets",
-    },
-    "pygment_light_style": "bw",
+    "collapse_navigation": False,
+    "logo": {"text": "beets"},
+    "show_nav_level": 2,  # How many levels in left sidebar to show automatically
+    "navigation_depth": 4,  # How many levels of navigation to expand
 }
 html_title = "beets"
 html_logo = "_static/beets_logo_nobg.png"
 html_static_path = ["_static"]
 html_css_files = ["beets.css"]
+
+
+def skip_member(app, what, name: str, obj, skip, options):
+    if name.startswith("_"):
+        return True
+    return skip
+
+
+def setup(app) -> None:
+    app.connect("autodoc-skip-member", skip_member)
